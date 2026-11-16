@@ -18,7 +18,7 @@ import {
   UploadCloud,
 } from 'lucide-react';
 import { NavPage, Project, RenderJob, StudioPreset } from '../types/studio';
-import { api, PresetWarning, resolveApiUrl, uploadVideoChunked } from '../lib/api';
+import { api, PresetWarning, processLocalVideoUpload, resolveApiUrl } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { indexedDbStore } from '../lib/indexedDbStore';
 import { importProjectBackupZip } from '../lib/projectBackup';
@@ -180,7 +180,7 @@ export function DashboardPage({
         setUploadStage('Preparing project for upload...');
       }
 
-      const updated = await uploadVideoChunked({
+      const updated = await processLocalVideoUpload({
         projectId: targetProjectId,
         file,
         onProgress: (pct, stage) => {
@@ -529,7 +529,7 @@ export function DashboardPage({
                   : 'Drop MP4, MOV, or MKV movie recap video here'}
               </div>
               <p className="text-xs text-zinc-500">
-                Chunked upload supports large files up to 2 GB and videos up to 30 minutes
+                100% browser-side File API + IndexedDB streaming · supports files up to 2 GB with zero server upload
               </p>
             </div>
             <div className="flex flex-wrap items-center justify-center gap-3 pt-1">
@@ -641,7 +641,7 @@ export function DashboardPage({
                         title="Manage local storage and portable project backup"
                       >
                         <Archive className="w-3 h-3 text-emerald-400" />
-                        <span className="text-emerald-300">100% Local SQLite</span>
+                        <span className="text-emerald-300">100% Browser Storage</span>
                       </button>
                       {!p.sourceVideoUrl ? (
                         <button

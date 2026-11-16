@@ -1580,42 +1580,74 @@ app.post('/api/projects/:id/dubbing/regenerate-segments', async (req, res) => {
   }
 });
 
-// AI Language Translation
+// AI Language Translation (supports server-stored or client-side IndexedDB project captions)
 app.post('/api/projects/:id/translate', async (req, res) => {
   try {
     const project = getProject(req.params.id);
-    if (!project) {
-      res.status(404).json({ error: 'Project not found' });
+    const captions = Array.isArray(req.body?.captions)
+      ? req.body.captions
+      : project?.captions;
+
+    if (!captions || !Array.isArray(captions)) {
+      res.status(404).json({ error: 'Project captions not found' });
       return;
     }
-    const targetLanguage = (req.body?.targetLanguage || project.translation.targetLanguage) as SupportedLanguage;
+
+    const sourceLanguage =
+      req.body?.sourceLanguage || project?.translation?.sourceLanguage || 'Auto';
+    const targetLanguage = (
+      req.body?.targetLanguage ||
+      project?.translation?.targetLanguage ||
+      'French'
+    ) as SupportedLanguage;
     const preserveProperNouns =
       req.body?.preserveProperNouns !== undefined
         ? Boolean(req.body.preserveProperNouns)
-        : project.translation.preserveProperNouns;
+        : Boolean(project?.translation?.preserveProperNouns ?? true);
 
     const translatedSegments = await translateCaptionsWithGemini({
-      captions: project.captions,
-      sourceLanguage: project.translation.sourceLanguage || 'Auto',
+      captions,
+      sourceLanguage,
       targetLanguage,
       preserveProperNouns,
     });
 
-    const updated = updateProject(project.id, {
-      captions: translatedSegments,
-      translation: {
-        ...project.translation,
+    const translationMeta = {
+      ...(project?.translation || {
+        sourceLanguage,
         targetLanguage,
         preserveProperNouns,
-        lastTranslatedAt: new Date().toISOString(),
-      },
-      subtitleStyle: {
-        ...project.subtitleStyle,
-        useTranslated: true,
+        lastTranslatedAt: null,
+      }),
+      sourceLanguage,
+      targetLanguage,
+      preserveProperNouns,
+      lastTranslatedAt: new Date().toISOString(),
+    };
+
+    if (project) {
+      const updated = updateProject(project.id, {
+        captions: translatedSegments,
+        translation: translationMeta,
+        subtitleStyle: {
+          ...project.subtitleStyle,
+          useTranslated: true,
+        },
+      });
+      res.json({ project: updated });
+      return;
+    }
+
+    res.json({
+      project: {
+        id: req.params.id,
+        captions: translatedSegments,
+        translation: translationMeta,
+        subtitleStyle: {
+          useTranslated: true,
+        },
       },
     });
-
-    res.json({ project: updated });
   } catch (err) {
     const status = (err as { statusCode?: number }).statusCode || 500;
     res.status(status).json({ error: err instanceof Error ? err.message : String(err) });

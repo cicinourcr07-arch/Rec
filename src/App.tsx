@@ -29,6 +29,8 @@ import {
   WorkflowStageId,
 } from './types/studio';
 import { api, PresetWarning } from './lib/api';
+import { hydrateAllProjectMediaUrls } from './lib/browserMediaStore';
+import { ensureFontLoaded } from './lib/fontCatalog';
 import { indexedDbStore } from './lib/indexedDbStore';
 import { LocalBackupModal } from './components/LocalBackupModal';
 import {
@@ -166,20 +168,26 @@ export default function App() {
         ? projRes.projects.filter((p): p is Project => Boolean(p && p.id))
         : [];
       const validJobs = Array.isArray(jobRes?.jobs) ? jobRes.jobs : [];
+      const fonts = Array.isArray(fontRes?.fonts) ? fontRes.fonts : [];
+      await hydrateAllProjectMediaUrls(
+        validProjects,
+        fonts.map((f) => f.url)
+      ).catch(() => {});
+      await Promise.all(
+        fonts.map((f) => ensureFontLoaded({ family: f.family, customUrl: f.url }).catch(() => null))
+      );
       setProjects(validProjects);
       void indexedDbStore.saveAllProjectSnapshots(validProjects);
       setRecentJobs(validJobs);
-      if (Array.isArray(fontRes?.fonts)) {
-        setCustomFonts(fontRes.fonts);
-      }
+      setCustomFonts(fonts);
       setActiveProjectId((prev) => {
         if (prev && validProjects.some((p) => p.id === prev)) return prev;
         return validProjects[0]?.id || null;
       });
     } catch {
-      // Offline / backend unreachable fallback: read local IndexedDB snapshots
       const cached = await indexedDbStore.listProjectSnapshots();
       if (cached.length > 0) {
+        await hydrateAllProjectMediaUrls(cached).catch(() => {});
         setProjects(cached);
         setActiveProjectId((prev) => prev || cached[0]?.id || null);
       }

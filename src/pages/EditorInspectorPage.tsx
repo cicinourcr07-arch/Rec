@@ -17,6 +17,7 @@ import {
   RotateCcw,
   Sliders,
   Sparkles,
+  Trash2,
   Undo2,
   UploadCloud,
   Volume2,
@@ -46,7 +47,7 @@ import {
   VisualEffectType,
   VoiceConfig,
 } from '../types/studio';
-import { api, resolveApiUrl, uploadVideoChunked } from '../lib/api';
+import { api, processLocalVideoUpload, resolveApiUrl } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { createWorkflowUpdate, resolveCanvasDimensions } from '../lib/workflowStages';
 import { LayerPanel } from '../components/LayerPanel';
@@ -360,9 +361,11 @@ export function EditorInspectorPage({
 
   const handleReplaceVideo = async (file: File) => {
     setErrorMsg(null);
+    setSuccessMsg(null);
     try {
       setUploadPct(2);
-      const updated = await uploadVideoChunked({
+      setExtractedAudio(null);
+      const updated = await processLocalVideoUpload({
         projectId: project.id,
         file,
         onProgress: (pct, stage) => {
@@ -371,11 +374,25 @@ export function EditorInspectorPage({
         },
       });
       onProjectUpdated(updated);
+      setSuccessMsg(`Loaded "${file.name}" in browser storage.`);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setUploadPct(null);
       setUploadStage('');
+    }
+  };
+
+  const handleRemoveVideo = async () => {
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    try {
+      const res = await api.removeProjectVideo(project.id);
+      setExtractedAudio(null);
+      onProjectUpdated(res.project);
+      setSuccessMsg('Removed video and revoked browser Object URL.');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -2210,13 +2227,27 @@ export function EditorInspectorPage({
                   e.target.value = '';
                 }}
               />
-              <button
-                onClick={() => fileRef.current?.click()}
-                className="px-2.5 py-1 rounded-md bg-violet-600 hover:bg-violet-500 text-[11px] font-medium text-white flex items-center gap-1 cursor-pointer"
-              >
-                <UploadCloud className="w-3 h-3" />
-                {project.sourceVideoUrl ? 'Replace' : 'Upload'}
-              </button>
+              <div className="flex items-center gap-1.5">
+                {project.sourceVideoUrl && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRemoveVideo()}
+                    className="px-2 py-1 rounded-md bg-zinc-800 hover:bg-red-600/20 hover:text-red-300 text-[11px] font-medium text-zinc-300 flex items-center gap-1 cursor-pointer"
+                    title="Remove video and free browser memory"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Remove
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  className="px-2.5 py-1 rounded-md bg-violet-600 hover:bg-violet-500 text-[11px] font-medium text-white flex items-center gap-1 cursor-pointer"
+                >
+                  <UploadCloud className="w-3 h-3" />
+                  {project.sourceVideoUrl ? 'Replace' : 'Select Video'}
+                </button>
+              </div>
             </div>
 
             {uploadPct !== null && (
@@ -2260,7 +2291,7 @@ export function EditorInspectorPage({
               </dl>
             ) : (
               <p className="text-xs text-zinc-500">
-                Supports MP4, MOV, and MKV files with chunked upload.
+                Supports MP4, MOV, and MKV files processed directly in your browser.
               </p>
             )}
           </div>
@@ -2287,6 +2318,7 @@ export function EditorInspectorPage({
                 <audio src={resolveApiUrl(extractedAudio.audioUrl)} controls className="w-full h-8" />
                 <a
                   href={resolveApiUrl(extractedAudio.downloadUrl)}
+                  download={extractedAudio.filename}
                   className="inline-flex items-center gap-1.5 text-[11px] text-violet-400 hover:text-violet-300"
                 >
                   <Download className="w-3 h-3" />

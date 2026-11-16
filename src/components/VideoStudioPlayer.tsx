@@ -2008,7 +2008,7 @@ export function VideoStudioPlayer({
               <video
                 ref={bgVideoRef}
                 src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
-                crossOrigin="anonymous"
+                crossOrigin={(resolvedUrls.video || '').startsWith('http') ? 'anonymous' : undefined}
                 muted
                 playsInline
                 aria-hidden="true"
@@ -2062,7 +2062,7 @@ export function VideoStudioPlayer({
                   <video
                     ref={videoRef}
                     src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
-                    crossOrigin="anonymous"
+                    crossOrigin={(resolvedUrls.video || '').startsWith('http') ? 'anonymous' : undefined}
                     playsInline
                     style={stageMetrics.fgVideoStyle}
                     onLoadedMetadata={(e) => {
@@ -2129,7 +2129,7 @@ export function VideoStudioPlayer({
               <video
                 ref={videoRef}
                 src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
-                crossOrigin="anonymous"
+                crossOrigin={(resolvedUrls.video || '').startsWith('http') ? 'anonymous' : undefined}
                 playsInline
                 style={{
                   filter: videoFilterCss,
@@ -2187,7 +2187,7 @@ export function VideoStudioPlayer({
                   {/* Dimmed full original video preview */}
                   <video
                     src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
-                    crossOrigin="anonymous"
+                    crossOrigin={(resolvedUrls.video || '').startsWith('http') ? 'anonymous' : undefined}
                     muted
                     playsInline
                     ref={(el) => {
@@ -2380,7 +2380,7 @@ export function VideoStudioPlayer({
                 ref={dubAudioRef}
                 src={resolvedUrls.dub || resolveApiUrl(project.voice.fullDubUrl)}
                 preload="auto"
-                crossOrigin="anonymous"
+                crossOrigin={(resolvedUrls.dub || '').startsWith('http') ? 'anonymous' : undefined}
               />
             )}
             {project.voice.bgMusicUrl && (
@@ -2389,7 +2389,7 @@ export function VideoStudioPlayer({
                 src={resolvedUrls.music || resolveApiUrl(project.voice.bgMusicUrl)}
                 loop
                 preload="auto"
-                crossOrigin="anonymous"
+                crossOrigin={(resolvedUrls.music || '').startsWith('http') ? 'anonymous' : undefined}
               />
             )}
             {project.voice.sfxUrl && (
@@ -2397,7 +2397,7 @@ export function VideoStudioPlayer({
                 ref={sfxAudioRef}
                 src={resolvedUrls.sfx || resolveApiUrl(project.voice.sfxUrl)}
                 preload="auto"
-                crossOrigin="anonymous"
+                crossOrigin={(resolvedUrls.sfx || '').startsWith('http') ? 'anonymous' : undefined}
               />
             )}
 
@@ -2582,13 +2582,18 @@ export function VideoStudioPlayer({
                     transformOrigin: 'center center',
                   }}
                 >
-                  <img
-                    src={resolveApiUrl(logo.url)}
-                    alt={logo.filename}
-                    crossOrigin="anonymous"
-                    draggable={false}
-                    className="w-full h-auto pointer-events-none select-none"
-                  />
+                  {(() => {
+                    const resolvedLogoSrc = resolveApiUrl(logo.url);
+                    return (
+                      <img
+                        src={resolvedLogoSrc}
+                        alt={logo.filename}
+                        crossOrigin={resolvedLogoSrc.startsWith('http') ? 'anonymous' : undefined}
+                        draggable={false}
+                        className="w-full h-auto pointer-events-none select-none"
+                      />
+                    );
+                  })()}
                   {showOutline &&
                     renderTransformHandles(
                       (dir, ev) => {

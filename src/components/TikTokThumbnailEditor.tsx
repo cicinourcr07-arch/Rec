@@ -17,6 +17,7 @@ import {
 import JSZip from 'jszip';
 import { Project, SavedFontAsset } from '../types/studio';
 import { api, resolveApiUrl } from '../lib/api';
+import { isLocalMediaUri, resolveBrowserMediaUrl } from '../lib/browserMediaStore';
 import { downloadProjectAsset } from '../lib/supabaseCloud';
 import {
   BUILTIN_FONT_CATALOG,
@@ -313,8 +314,12 @@ async function drawThumbnailToCanvas(
 
   // Load source frame image cleanly
   const img = new Image();
-  img.crossOrigin = 'anonymous';
-  const resolvedImageUrl = resolveApiUrl(design.imageUrl);
+  const resolvedImageUrl = isLocalMediaUri(design.imageUrl)
+    ? (await resolveBrowserMediaUrl(design.imageUrl)) || resolveApiUrl(design.imageUrl)
+    : resolveApiUrl(design.imageUrl);
+  if (!resolvedImageUrl.startsWith('blob:') && !resolvedImageUrl.startsWith('data:')) {
+    img.crossOrigin = 'anonymous';
+  }
   await new Promise<void>((resolve, reject) => {
     img.onload = () => resolve();
     img.onerror = () => reject(new Error(`Failed to load thumbnail frame: ${resolvedImageUrl}`));
@@ -1035,6 +1040,9 @@ export function TikTokThumbnailEditor({
                       onChange={(e) => {
                         const file = e.target.files?.[0];
                         if (!file) return;
+                        if (activeDesign.imageUrl.startsWith('blob:')) {
+                          URL.revokeObjectURL(activeDesign.imageUrl);
+                        }
                         const blobUrl = URL.createObjectURL(file);
                         updateActiveDesign({ imageUrl: blobUrl });
                         e.target.value = '';
@@ -1371,7 +1379,7 @@ export function TikTokThumbnailEditor({
                           0,
                           6
                         )}.${st.format}`,
-                      }).catch((err) =>
+                      }).catch((err: unknown) =>
                         setErrorMsg(err instanceof Error ? err.message : String(err))
                       )
                     }

@@ -25,6 +25,7 @@ import {
   SavedFontAsset,
 } from '../types/studio';
 import { api, resolveApiUrl } from '../lib/api';
+import { getMediaBlob, isLocalMediaUri, resolveBrowserMediaUrl } from '../lib/browserMediaStore';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import {
   downloadProjectAsset,
@@ -106,15 +107,29 @@ export function ExportCenterPage({
       setExportValidationMsg(null);
       setVideoMetaInfo(null);
       try {
+        if (isLocalMediaUri(url) || url.startsWith('blob:')) {
+          const blob = await getMediaBlob(url);
+          const playable = isLocalMediaUri(url) ? await resolveBrowserMediaUrl(url) : url;
+          if (blob && blob.size >= 512 && playable) {
+            setResolvedExportUrl(playable);
+            setExportValidation('valid');
+            return;
+          }
+          setExportValidation('error');
+          setExportValidationMsg(
+            'Exported video blob is missing or incomplete in browser storage. Click GENERATE FINAL VIDEO to re-render.'
+          );
+          return;
+        }
+
         const resolvedUrl = resolveApiUrl(url);
         const res = await fetch(resolvedUrl, { method: 'HEAD', cache: 'no-store' });
         const size = Number(res.headers.get('content-length') || 0);
-        if (res.ok && size >= 1024) {
+        if (res.ok && size >= 512) {
           setResolvedExportUrl(`${resolvedUrl}?v=${encodeURIComponent(project.lastExportedAt || '1')}`);
           setExportValidation('valid');
           return;
         }
-        // Cross-device fallback: resolve authenticated signed URL from Supabase Cloud Storage
         const signedUrl = await resolvePlayableAssetUrl(url, project.cloudAssets);
         if (signedUrl) {
           setResolvedExportUrl(signedUrl);
@@ -124,8 +139,8 @@ export function ExportCenterPage({
         setExportValidation('error');
         setExportValidationMsg(
           !res.ok
-            ? `Exported video file not found locally (HTTP ${res.status}) and no verified cloud copy was found.`
-            : 'Exported MP4 is empty or incomplete (0 bytes). Re-render Final MP4.'
+            ? `Exported video file not found (HTTP ${res.status}).`
+            : 'Exported video is empty or incomplete (0 bytes). Re-render Final Video.'
         );
       } catch (err) {
         const signedUrl = await resolvePlayableAssetUrl(url, project.cloudAssets).catch(
@@ -138,7 +153,7 @@ export function ExportCenterPage({
         }
         setExportValidation('error');
         setExportValidationMsg(
-          err instanceof Error ? err.message : 'Unable to verify exported MP4.'
+          err instanceof Error ? err.message : 'Unable to verify exported video.'
         );
       }
     },
@@ -236,13 +251,12 @@ export function ExportCenterPage({
           onProjectUpdated(synced);
           setPreviewMode('rendered');
           void verifyExportedFile(synced.lastExportUrl);
-          // Automatically upload & verify rendered MP4 to Supabase Free Cloud if signed in
           void uploadFinalMp4ToCloud(synced);
         }
       } catch {
         // ignore transient poll errors
       }
-    }, 900);
+    }, 400);
 
     return () => clearInterval(timer);
   }, [activeJob, project.id, onProjectUpdated, verifyExportedFile, uploadFinalMp4ToCloud]);
@@ -315,7 +329,7 @@ export function ExportCenterPage({
             </h1>
           </div>
           <p className="text-sm text-zinc-400 mt-1">
-            FFmpeg renders locally on your machine, then uploads &amp; verifies the finished MP4 to Supabase Free Cloud for multi-device download.
+            Browser Canvas 2D + Web Audio + MediaRecorder composites and encodes your finished video 100% locally in your browser.
           </p>
         </div>
 
@@ -539,7 +553,7 @@ export function ExportCenterPage({
               <div>
                 <label className="text-xs text-zinc-400">Codec & Container</label>
                 <div className="mt-1 bg-[#18181D] border border-white/[0.08] rounded-lg px-2.5 py-2 text-xs font-mono text-zinc-300">
-                  MP4 · H.264 / AAC
+                  Browser MediaRecorder (MP4 / WebM)
                 </div>
               </div>
             </div>
@@ -675,7 +689,7 @@ export function ExportCenterPage({
                 </h2>
                 <p className="text-xs text-zinc-400">
                   {previewMode === 'rendered' && project.lastExportUrl
-                    ? 'Verified MP4 output encoded locally by FFmpeg (H.264 / AAC) and playable across devices.'
+                    ? 'Rendered locally in your browser via Canvas 2D + MediaRecorder and saved in IndexedDB.'
                     : 'Real-time workspace preview — click GENERATE FINAL VIDEO to encode locally.'}
                 </p>
               </div>
@@ -905,7 +919,7 @@ export function ExportCenterPage({
                         ref={finalVideoRef}
                         key={`${resolvedExportUrl}_${project.lastExportedAt || ''}`}
                         src={resolvedExportUrl}
-                        crossOrigin="anonymous"
+                        crossOrigin={resolvedExportUrl.startsWith('http') ? 'anonymous' : undefined}
                         controls
                         playsInline
                         preload="metadata"
@@ -920,7 +934,7 @@ export function ExportCenterPage({
                         onError={() => {
                           setExportValidation('error');
                           setExportValidationMsg(
-                            'Browser could not decode the rendered MP4 stream. Please click GENERATE FINAL VIDEO to re-encode.'
+                            'Browser could not decode the rendered video stream. Please click GENERATE FINAL VIDEO to re-encode.'
                           );
                         }}
                         className="w-full h-full object-contain bg-black"
@@ -935,7 +949,7 @@ export function ExportCenterPage({
                           : `${resolvedDims.width}×${resolvedDims.height}`}
                       </span>
                       <span>
-                        {project.lastExportSize ? formatBytes(project.lastExportSize) : ''} · H.264 / AAC
+                        {project.lastExportSize ? formatBytes(project.lastExportSize) : ''} · Browser Export
                       </span>
                     </div>
                   </>
@@ -948,7 +962,7 @@ export function ExportCenterPage({
                   No Final Video Rendered Yet
                 </div>
                 <p className="text-xs text-zinc-500 max-w-md mx-auto leading-relaxed">
-                  Click <strong>GENERATE FINAL VIDEO</strong> above to encode the finished MP4, or
+                  Click <strong>GENERATE FINAL VIDEO</strong> above to render in your browser, or
                   switch to <strong>Draft Preview</strong> to inspect your layers before rendering.
                 </p>
               </div>
@@ -977,12 +991,20 @@ export function ExportCenterPage({
                     <div className="flex items-center gap-3 shrink-0 font-mono tabular-nums">
                       <span className="text-zinc-400">{Math.round(j.progress)}%</span>
                       {j.outputUrl && (
-                        <a
-                          href={resolveApiUrl(`${j.outputUrl}?download=1`)}
-                          className="text-violet-400 hover:text-violet-300 font-medium"
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void downloadProjectAsset({
+                              url: j.outputUrl,
+                              filename: `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_render_${j.id.slice(0, 6)}.mp4`,
+                            }).catch((err) =>
+                              setErrorMsg(err instanceof Error ? err.message : String(err))
+                            )
+                          }
+                          className="text-violet-400 hover:text-violet-300 font-medium cursor-pointer"
                         >
-                          Download MP4
-                        </a>
+                          Download
+                        </button>
                       )}
                     </div>
                   </div>

@@ -5,6 +5,7 @@
 
 import { Project, CloudAssetManifestEntry } from '../types/studio';
 import { resolveApiUrl } from './api';
+import { getMediaBlob, isLocalMediaUri, resolveBrowserMediaUrl } from './browserMediaStore';
 
 export function isSupabaseConfigured(): boolean {
   return false;
@@ -29,6 +30,9 @@ export async function resolvePlayableAssetUrl(
   _cloudAssets?: Record<string, CloudAssetManifestEntry>
 ): Promise<string | null> {
   if (!url) return null;
+  if (isLocalMediaUri(url)) {
+    return (await resolveBrowserMediaUrl(url)) || null;
+  }
   return resolveApiUrl(url);
 }
 
@@ -40,10 +44,21 @@ export async function downloadProjectAsset(opts: {
 }): Promise<void> {
   const rawTarget = opts.url || opts.localUrl;
   if (!rawTarget) return;
-  const targetUrl = resolveApiUrl(rawTarget);
+
   try {
-    const res = await fetch(targetUrl);
-    const blob = await res.blob();
+    let blob: Blob | null = null;
+    if (isLocalMediaUri(rawTarget)) {
+      blob = await getMediaBlob(rawTarget);
+    } else {
+      const targetUrl = resolveApiUrl(rawTarget);
+      const res = await fetch(targetUrl);
+      if (res.ok) blob = await res.blob();
+    }
+
+    if (!blob) {
+      throw new Error('Asset file was not found in browser storage.');
+    }
+
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = blobUrl;
@@ -51,10 +66,10 @@ export async function downloadProjectAsset(opts: {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 4000);
   } catch (err) {
     console.error('Download error:', err);
-    window.open(targetUrl, '_blank');
+    throw err;
   }
 }
 
@@ -89,7 +104,7 @@ export async function uploadSingleProjectAssetToCloud(
 }> {
   return {
     project,
-    message: 'Saved locally (100% local mode).',
+    message: 'Saved locally in browser IndexedDB.',
     failedUploads: [],
     skippedLargeAssets: [],
     cancelled: false,

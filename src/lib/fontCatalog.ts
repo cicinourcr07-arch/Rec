@@ -1,4 +1,4 @@
-import { resolveApiUrl } from './api';
+import { isLocalMediaUri, resolveBrowserMediaUrl } from './browserMediaStore';
 
 export type FontCategoryId =
   | 'Modern'
@@ -103,10 +103,10 @@ export function resolveClosestSupportedWeight(family: string, desired: number): 
   );
 }
 
-// Runtime browser FontFace registry so we NEVER pretend an unloaded font succeeded
 const statusCache = new Map<string, FontStatusEntry>();
 const pendingLoads = new Map<string, Promise<FontStatusEntry>>();
 const listeners = new Set<() => void>();
+const injectedGoogleFontLinks = new Set<string>();
 
 function notifyFontListeners() {
   for (const cb of listeners) {
@@ -142,6 +142,31 @@ export function getAllLoadedFontStatuses(): Record<string, FontStatusEntry> {
   return out;
 }
 
+function injectGoogleFontStylesheet(family: string, weights: number[], supportsItalic: boolean): void {
+  if (typeof document === 'undefined' || family.toLowerCase() === 'impact') return;
+  const linkKey = `${family}:${weights.join(',')}`;
+  if (injectedGoogleFontLinks.has(linkKey)) return;
+  injectedGoogleFontLinks.add(linkKey);
+
+  const uniqWeights = Array.from(new Set(weights)).sort((a, b) => a - b);
+  const encodedFamily = family.trim().replace(/\s+/g, '+');
+  let spec = '';
+  if (supportsItalic) {
+    const tuples = [
+      ...uniqWeights.map((w) => `0,${w}`),
+      ...uniqWeights.map((w) => `1,${w}`),
+    ];
+    spec = `ital,wght@${tuples.join(';')}`;
+  } else {
+    spec = `wght@${uniqWeights.join(';')}`;
+  }
+
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = `https://fonts.googleapis.com/css2?family=${encodedFamily}:${spec}&display=swap`;
+  document.head.appendChild(link);
+}
+
 export async function ensureFontLoaded(params: {
   family: string;
   weight?: number;
@@ -172,66 +197,61 @@ export async function ensureFontLoaded(params: {
     notifyFontListeners();
 
     try {
-      let fontUrl = customUrl;
-      let availableForExport = true;
-      let source: FontStatusEntry['source'] = customUrl ? 'custom' : 'builtin';
-
-      if (!fontUrl) {
-        // Ask server to resolve & cache real TTF file for both browser + FFmpeg libass
-        const resp = await fetch(
-          resolveApiUrl(
-            `/api/fonts/ensure?family=${encodeURIComponent(cleanFamily)}&weight=${resolvedWeight}&italic=${italic ? '1' : '0'}`
-          )
-        );
-        const data = (await resp.json()) as {
-          available?: boolean;
-          url?: string;
-          error?: string;
-          source?: 'builtin' | 'custom' | 'system';
-          resolvedWeight?: number;
-        };
-        if (!resp.ok || !data.available || !data.url) {
-          const entry: FontStatusEntry = {
-            family: cleanFamily,
-            status: 'error',
-            availableForExport: false,
-            error: data.error || `Font "${cleanFamily}" file could not be loaded.`,
+      if (customUrl) {
+        const resolvedUrl = isLocalMediaUri(customUrl)
+          ? await resolveBrowserMediaUrl(customUrl)
+          : customUrl;
+        if (!resolvedUrl) {
+          throw new Error(`Custom font "${cleanFamily}" was not found in browser storage.`);
+        }
+        if (typeof FontFace !== 'undefined' && typeof document !== 'undefined') {
+          const descriptors: FontFaceDescriptors = {
+            weight: String(resolvedWeight),
+            style: italic ? 'italic' : 'normal',
           };
-          statusCache.set(key, entry);
-          statusCache.set(`${cleanFamily}::any`, entry);
-          notifyFontListeners();
-          return entry;
+          const face = new FontFace(cleanFamily, `url('${resolvedUrl}')`, descriptors);
+          const loadedFace = await face.load();
+          document.fonts.add(loadedFace);
+          await document.fonts.ready;
         }
-        fontUrl = resolveApiUrl(data.url);
-        source = data.source || 'builtin';
-      } else {
-        fontUrl = resolveApiUrl(fontUrl);
-        // Verify custom URL is reachable & non-empty
-        const head = await fetch(fontUrl, { method: 'HEAD' });
-        if (!head.ok) {
-          throw new Error(`Font file "${fontUrl}" is missing (HTTP ${head.status}).`);
-        }
-        if (/\.woff2?$/i.test(fontUrl)) {
-          availableForExport = false;
-        }
+        const okEntry: FontStatusEntry = {
+          family: cleanFamily,
+          status: 'loaded',
+          availableForExport: true,
+          source: 'custom',
+          loadedWeights: [resolvedWeight],
+        };
+        statusCache.set(key, okEntry);
+        statusCache.set(`${cleanFamily}::any`, okEntry);
+        notifyFontListeners();
+        return okEntry;
       }
 
-      if (typeof FontFace !== 'undefined' && typeof document !== 'undefined') {
-        const descriptors: FontFaceDescriptors = {
-          weight: String(resolvedWeight),
-          style: italic ? 'italic' : 'normal',
-        };
-        const face = new FontFace(cleanFamily, `url('${fontUrl}')`, descriptors);
-        const loadedFace = await face.load();
-        document.fonts.add(loadedFace);
-        await document.fonts.ready;
+      // Built-in catalog font or system font loaded client-side via Google Fonts / document.fonts
+      const catalogItem = BUILTIN_FONT_CATALOG.find(
+        (f) => f.family.toLowerCase() === cleanFamily.toLowerCase()
+      );
+      if (catalogItem && cleanFamily.toLowerCase() !== 'impact') {
+        injectGoogleFontStylesheet(
+          catalogItem.family,
+          catalogItem.weights,
+          catalogItem.supportsItalic
+        );
+      }
+
+      if (typeof document !== 'undefined' && document.fonts) {
+        const spec = `${italic ? 'italic ' : ''}${resolvedWeight} 32px '${cleanFamily}'`;
+        await Promise.race([
+          document.fonts.load(spec),
+          new Promise((resolve) => setTimeout(resolve, 3500)),
+        ]);
       }
 
       const okEntry: FontStatusEntry = {
         family: cleanFamily,
         status: 'loaded',
-        availableForExport,
-        source,
+        availableForExport: true,
+        source: catalogItem ? 'builtin' : 'system',
         loadedWeights: [resolvedWeight],
       };
       statusCache.set(key, okEntry);

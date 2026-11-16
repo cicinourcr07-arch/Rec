@@ -144,7 +144,7 @@ export function LocalBackupModal({
               Local Storage, Backups &amp; Portable Archives
             </h2>
             <p className="text-xs text-zinc-400 mt-0.5">
-              100% local operation via SQLite storage, local FFmpeg rendering, and browser IndexedDB.
+              100% browser-native operation via File API, Canvas/MediaRecorder, and IndexedDB.
             </p>
           </div>
           <button
@@ -185,14 +185,14 @@ export function LocalBackupModal({
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="p-4 rounded-lg bg-[#09090B] border border-white/[0.08] space-y-2">
               <div className="flex items-center justify-between text-xs text-zinc-400">
-                <span>Local Server Disk</span>
+                <span>Browser Media Store</span>
                 <HardDrive className="w-3.5 h-3.5 text-violet-400" />
               </div>
               <div className="text-sm font-mono tabular-nums font-semibold text-white">
                 {formatBytes(localUsage?.totalBytes ?? 0)}
               </div>
               <div className="text-[11px] font-mono tabular-nums text-zinc-500">
-                SQLite DB + Local FFmpeg buckets
+                IndexedDB Blobs &amp; Object URLs
               </div>
             </div>
 

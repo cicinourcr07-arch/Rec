@@ -206,15 +206,15 @@ export function PresetLibraryPanel({
             <Upload className="w-3 h-3" />
             Import
           </button>
-          <a
-            href={api.exportPresetsUrl}
-            download="recap-studio-presets.json"
+          <button
+            type="button"
+            onClick={() => void api.downloadPresetsJson()}
             title="Export all saved presets as JSON"
             className="px-2 py-1 rounded bg-zinc-900 hover:bg-zinc-800 border border-white/[0.08] text-[10.5px] text-zinc-300 flex items-center gap-1 cursor-pointer"
           >
             <Download className="w-3 h-3" />
             Export
-          </a>
+          </button>
         </div>
       </div>
 

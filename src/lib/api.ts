@@ -1,6 +1,12 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { v4 as uuidv4 } from 'uuid';
 import {
-  CaptionSegment,
   CloudAssetKind,
+  DEFAULT_VIDEO_CANVAS,
   FishVoiceModel,
   GeminiVoiceName,
   PresetCategory,
@@ -15,7 +21,74 @@ import {
   SystemStatus,
   VideoMetadata,
 } from '../types/studio';
-import type { FontCatalogItem } from './fontCatalog';
+import {
+  BUILTIN_FONT_CATALOG,
+  ensureFontLoaded,
+  type FontCatalogItem,
+} from './fontCatalog';
+import {
+  cleanupOrphanedBrowserMedia,
+  collectProjectMediaUris,
+  computeBlobSha256,
+  deleteMediaAsset,
+  deleteProjectMediaAssets,
+  getBrowserMediaUsage,
+  getCachedObjectUrl,
+  getMediaBlob,
+  getMediaRecord,
+  isLocalMediaUri,
+  resolveBrowserMediaUrl,
+  saveMediaBlob,
+} from './browserMediaStore';
+import {
+  dataUrlToBlob,
+  extractBrowserAudioTrack,
+  extractBrowserThumbnailFrames,
+  probeAudioDuration,
+  probeVideoMetadataAndCover,
+  synthesizeBrowserSampleVideo,
+  validateAudioFile,
+  validateBrowserVideoFile,
+  validateFontFile,
+  validateImageFile,
+} from './browserVideoProcessor';
+import {
+  compressBrowserVideo,
+  renderProjectInBrowser,
+} from './browserVideoExporter';
+import {
+  applyPresetsToProjectObject,
+  buildDefaultProject,
+  ClientPresetApplyOptions,
+  ClientPresetWarning,
+  createPresetLocal,
+  createSavedFishVoiceLocal,
+  deleteCustomFontLocal,
+  deletePresetLocal,
+  deleteProjectLocal,
+  deleteSavedFishVoiceLocal,
+  generateSrtContent,
+  generateVttContent,
+  getJobLocal,
+  getProjectLocal,
+  importPresetsLocal,
+  listAllJobsLocal,
+  listCustomFontsLocal,
+  listPresetsLocal,
+  listProjectJobsLocal,
+  listProjectsLocal,
+  listSavedFishVoicesLocal,
+  parseSrtOrVtt,
+  saveCustomFontLocal,
+  saveProjectLocal,
+  updatePresetLocal,
+  updateProjectLocal,
+  updateSavedFishVoiceLocal,
+  upsertJobLocal,
+} from './clientStore';
+
+export type PresetApplyOptions = ClientPresetApplyOptions;
+export type PresetWarning = ClientPresetWarning;
 
 export interface LocalAssetManifestItem {
   localUrl: string;
@@ -30,10 +103,10 @@ export interface LocalAssetManifestItem {
   necessaryForCloudSync: boolean;
 }
 
+// Optional external AI API base URL (only used for server-side key-protected Gemini / Fish Audio AI calls)
 export const API_BASE_URL = String(
   (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL) ||
     (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_BACKEND_URL) ||
-    (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_APP_URL) ||
     ''
 )
   .trim()
@@ -41,6 +114,9 @@ export const API_BASE_URL = String(
 
 export function resolveApiUrl(path: string): string {
   if (!path) return '';
+  if (isLocalMediaUri(path)) {
+    return getCachedObjectUrl(path);
+  }
   if (
     path.startsWith('http://') ||
     path.startsWith('https://') ||
@@ -53,16 +129,15 @@ export function resolveApiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${cleanPath}` : cleanPath;
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+async function aiBackendRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const fullUrl = resolveApiUrl(url);
   let res: Response;
   try {
     res = await fetch(fullUrl, init);
   } catch (err) {
-    const target = API_BASE_URL || 'current origin';
     const detail = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `Network error reaching backend (${target}): ${detail}. Ensure the Express server is running and CORS allows this frontend origin.`
+      `Automated AI service is unreachable (${detail}). Video handling, preview, export, SRT/VTT import, and External Gemini (No Key) work 100% locally in your browser.`
     );
   }
   const raw = await res.text();
@@ -75,76 +150,190 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     }
   }
   if (!res.ok) {
-    let errMsg = typeof data?.error === 'string' ? data.error : '';
-    if (!errMsg) {
-      if (res.status === 405) {
-        errMsg = `Request failed (405 Method Not Allowed): Cloudflare Pages only serves static files and rejected the ${
-          init?.method || 'POST'
-        } request. Set BACKEND_URL in Cloudflare Pages or VITE_API_BASE_URL to your Express backend.`;
-      } else {
-        errMsg = `Request failed (${res.status})`;
-      }
+    if (res.status === 405 || res.status === 404) {
+      throw new Error(
+        `Automated server-side AI endpoint is unavailable on static hosting (HTTP ${res.status}). API keys are never exposed in frontend code — use External Gemini (No Key) mode or run with an AI backend configured.`
+      );
     }
+    const errMsg = typeof data?.error === 'string' ? data.error : `AI request failed (${res.status})`;
     throw new Error(errMsg);
   }
   if (!data) {
-    throw new Error('Server returned an unexpected non-JSON response. Please try again.');
+    throw new Error('Unexpected non-JSON response from AI endpoint.');
   }
   return data as T;
 }
 
-export interface PresetApplyOptions {
-  captionPresetId?: string | null;
-  filterPresetId?: string | null;
-  editingPresetId?: string | null;
-  applyDefaults?: boolean;
+export async function processLocalVideoUpload(params: {
+  projectId: string;
+  file: File;
+  onProgress: (pct: number, stage: string) => void;
+}): Promise<Project> {
+  const { projectId, file, onProgress } = params;
+  validateBrowserVideoFile(file);
+
+  const existing = await getProjectLocal(projectId);
+  if (!existing) {
+    throw new Error('Target project not found in browser storage.');
+  }
+
+  onProgress(6, 'Validating video stream locally in browser...');
+  const { metadata, coverBlob, waveformPeaks } = await probeVideoMetadataAndCover(
+    file,
+    file.name,
+    onProgress
+  );
+
+  // Store disk-backed File/Blob handle & revoke prior video + thumbnail Object URLs cleanly
+  const savedVideo = await saveMediaBlob({
+    bucket: 'video',
+    filename: file.name,
+    blob: file,
+    mimeType: file.type || 'video/mp4',
+    existingUrlToRevoke: existing.sourceVideoUrl,
+  });
+
+  let nextThumbUrl = existing.thumbnailUrl;
+  if (coverBlob) {
+    const savedThumb = await saveMediaBlob({
+      bucket: 'thumbs',
+      filename: `${file.name.replace(/\.[^.]+$/, '')}_cover.jpg`,
+      blob: coverBlob,
+      mimeType: 'image/jpeg',
+      existingUrlToRevoke: existing.thumbnailUrl,
+    });
+    nextThumbUrl = savedThumb.uri;
+  } else if (existing.thumbnailUrl) {
+    await deleteMediaAsset(existing.thumbnailUrl);
+    nextThumbUrl = null;
+  }
+
+  if (existing.lastExportUrl) {
+    await deleteMediaAsset(existing.lastExportUrl);
+  }
+
+  const updated = await updateProjectLocal(projectId, {
+    sourceVideoUrl: savedVideo.uri,
+    sourceFilename: file.name,
+    thumbnailUrl: nextThumbUrl,
+    metadata,
+    waveformPeaks,
+    lastExportUrl: null,
+    lastExportSize: null,
+    lastExportedAt: null,
+  });
+
+  onProgress(100, 'Video ready in browser workspace');
+  return updated;
 }
 
-export interface PresetWarning {
-  presetName: string;
-  missingAssets: StudioPresetAssetRef[];
-}
+// Legacy alias kept so any callers continue compiling without backend calls
+export const uploadVideoChunked = processLocalVideoUpload;
 
 export const api = {
-  getSystemStatus: () => request<SystemStatus>('/api/system/status'),
+  // Diagnostics: returns real browser status + optional AI server status without failing static sites
+  getSystemStatus: async (): Promise<SystemStatus> => {
+    try {
+      const serverStatus = await aiBackendRequest<SystemStatus>('/api/system/status');
+      return serverStatus;
+    } catch {
+      return {
+        geminiConfigured: false,
+        fishConfigured: false,
+        ffmpegAvailable: typeof MediaRecorder !== 'undefined',
+        ffprobeAvailable: typeof HTMLVideoElement !== 'undefined',
+        ffmpegVersion: 'Browser Canvas + MediaRecorder',
+        storageDir: 'Browser IndexedDB + File API',
+        maxUploadSizeMb: 2048,
+        tempRetentionHours: 24,
+        supportedVideoFormats: ['MP4', 'MOV', 'MKV'],
+        supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
+      };
+    }
+  },
 
-  getSupabaseSchema: () => request<{ sql: string }>('/api/system/supabase-schema'),
+  getLocalStorageUsage: () => getBrowserMediaUsage(),
 
-  getLocalStorageUsage: () =>
-    request<{
-      totalBytes: number;
-      buckets: Record<string, { bytes: number; files: number }>;
-    }>('/api/system/storage-usage'),
+  runCleanup: async () => {
+    const [projects, fonts] = await Promise.all([listProjectsLocal(), listCustomFontsLocal()]);
+    const removedFiles = await cleanupOrphanedBrowserMedia(
+      projects,
+      fonts.map((f) => f.url)
+    );
+    return { removedFiles };
+  },
 
-  runCleanup: () => request<{ removedFiles: number }>('/api/system/cleanup', { method: 'POST' }),
+  getProjectAssetManifest: async (projectId: string) => {
+    const project = await getProjectLocal(projectId);
+    if (!project) {
+      return { assets: [], totalBytes: 0, necessaryBytes: 0, oversizedCount: 0 };
+    }
+    const items = collectProjectMediaUris(project);
+    const assets: LocalAssetManifestItem[] = [];
+    let totalBytes = 0;
+    let necessaryBytes = 0;
+    let oversizedCount = 0;
 
-  getProjectAssetManifest: (projectId: string) =>
-    request<{
-      assets: LocalAssetManifestItem[];
-      totalBytes: number;
-      necessaryBytes: number;
-      oversizedCount: number;
-    }>(`/api/projects/${projectId}/asset-manifest`),
+    for (const item of items) {
+      const rec = await getMediaRecord(item.uri);
+      const exists = Boolean(rec && rec.blob);
+      const sizeBytes = rec?.sizeBytes || 0;
+      const sha256 = rec?.blob ? await computeBlobSha256(rec.blob) : '';
+      const exceedsFree50MbCap = sizeBytes > 50 * 1024 * 1024;
+      if (exists) {
+        totalBytes += sizeBytes;
+        if (item.necessary) necessaryBytes += sizeBytes;
+        if (exceedsFree50MbCap) oversizedCount += 1;
+      }
+      assets.push({
+        localUrl: item.uri,
+        bucket: item.bucket,
+        filename: item.filename,
+        assetKind: item.assetKind,
+        mimeType: rec?.mimeType || 'application/octet-stream',
+        sizeBytes,
+        sha256,
+        exists,
+        exceedsFree50MbCap,
+        necessaryForCloudSync: item.necessary,
+      });
+    }
 
-  compressProjectVideo: (
+    return { assets, totalBytes, necessaryBytes, oversizedCount };
+  },
+
+  compressProjectVideo: async (
     projectId: string,
     preset: 'under-45mb' | '720p-compact' | '480p-compact',
     target: 'source' | 'final-export' = 'source'
-  ) =>
-    request<{
-      project: Project;
-      compressedUrl: string;
-      filename: string;
-      originalSourceUrl: string;
-      originalBytes: number;
-      compressedBytes: number;
-      metadata: VideoMetadata;
-      target: 'source' | 'final-export';
-    }>(`/api/projects/${projectId}/compress-video`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ preset, target }),
-    }),
+  ) => {
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    const res = await compressBrowserVideo({ project, preset, target });
+    const patch: Partial<Project> =
+      target === 'final-export'
+        ? {
+            lastExportUrl: res.compressedUri,
+            lastExportSize: res.compressedBytes,
+            lastExportedAt: new Date().toISOString(),
+          }
+        : {
+            sourceVideoUrl: res.compressedUri,
+            sourceFilename: res.filename,
+            metadata: res.metadata,
+          };
+    const updated = await updateProjectLocal(projectId, patch);
+    return {
+      project: updated,
+      compressedUrl: res.compressedUri,
+      filename: res.filename,
+      originalSourceUrl: project.sourceVideoUrl || '',
+      originalBytes: res.originalBytes,
+      compressedBytes: res.compressedBytes,
+      metadata: res.metadata,
+      target,
+    };
+  },
 
   saveProjectThumbnail: async (
     projectId: string,
@@ -157,39 +346,39 @@ export const api = {
       setAsCover?: boolean;
     }
   ) => {
-    const fd = new FormData();
-    fd.append('file', params.blob, `thumb.${params.format}`);
-    fd.append('label', params.label);
-    fd.append('width', String(params.width));
-    fd.append('height', String(params.height));
-    fd.append('format', params.format);
-    fd.append('setAsCover', params.setAsCover ? 'true' : 'false');
-    return request<{
-      thumbnail: {
-        id: string;
-        url: string;
-        label: string;
-        width: number;
-        height: number;
-        format: 'png' | 'jpg';
-        createdAt: string;
-      };
-      project: Project;
-    }>(`/api/projects/${projectId}/thumbnails/save`, {
-      method: 'POST',
-      body: fd,
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    const saved = await saveMediaBlob({
+      bucket: 'thumbs',
+      filename: `saved_${Date.now()}.${params.format}`,
+      blob: params.blob,
+      mimeType: params.format === 'png' ? 'image/png' : 'image/jpeg',
     });
+    const entry = {
+      id: uuidv4(),
+      url: saved.uri,
+      label: params.label,
+      width: params.width,
+      height: params.height,
+      format: params.format,
+      createdAt: new Date().toISOString(),
+    };
+    const nextSavedThumbs = [entry, ...(project.savedThumbnails || [])].slice(0, 24);
+    const updated = await updateProjectLocal(projectId, {
+      savedThumbnails: nextSavedThumbs,
+      ...(params.setAsCover ? { thumbnailUrl: saved.uri } : {}),
+    });
+    return { thumbnail: entry, project: updated };
   },
 
-  upsertProjectFromCloud: (project: Project) =>
-    request<{ project: Project }>('/api/projects/upsert-from-cloud', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project }),
-    }),
+  upsertProjectFromCloud: async (project: Project) => {
+    const saved = await saveProjectLocal(project);
+    await resolveBrowserMediaUrl(saved.sourceVideoUrl).catch(() => null);
+    return { project: saved };
+  },
 
   hydrateAssetFromBlob: async (
-    projectId: string,
+    _projectId: string,
     params: {
       blob: Blob;
       bucket: string;
@@ -199,20 +388,563 @@ export const api = {
       targetLocalUrl?: string;
     }
   ) => {
-    const fd = new FormData();
-    fd.append('file', params.blob, params.filename);
-    fd.append('bucket', params.bucket);
-    fd.append('filename', params.filename);
-    fd.append('assetKind', params.assetKind);
-    fd.append('mimeType', params.mimeType);
-    if (params.targetLocalUrl) fd.append('targetLocalUrl', params.targetLocalUrl);
-    return request<{ localUrl: string; filePath: string; sizeBytes: number }>(
-      `/api/projects/${projectId}/hydrate-asset`,
-      {
-        method: 'POST',
-        body: fd,
-      }
+    const saved = await saveMediaBlob({
+      bucket: params.bucket,
+      filename: params.filename,
+      blob: params.blob,
+      mimeType: params.mimeType,
+      targetUri: params.targetLocalUrl,
+    });
+    return {
+      localUrl: saved.uri,
+      filePath: saved.uri,
+      sizeBytes: saved.sizeBytes,
+    };
+  },
+
+  // Fish Saved Voices (IndexedDB)
+  listSavedFishVoices: async () => ({ voices: await listSavedFishVoicesLocal() }),
+  createSavedFishVoice: (params: { name: string; voiceId: string; isDefault?: boolean }) =>
+    createSavedFishVoiceLocal(params),
+  updateSavedFishVoice: (
+    id: string,
+    params: { name?: string; voiceId?: string; isDefault?: boolean }
+  ) => updateSavedFishVoiceLocal(id, params),
+  deleteSavedFishVoice: (id: string) => deleteSavedFishVoiceLocal(id),
+
+  // Custom Fonts (IndexedDB + Browser FontFace)
+  listCustomFonts: async () => ({ fonts: await listCustomFontsLocal() }),
+  getFontCatalog: async () => ({
+    builtin: BUILTIN_FONT_CATALOG as FontCatalogItem[],
+    custom: await listCustomFontsLocal(),
+  }),
+  ensureFont: async (family: string, weight = 700, italic = false) => {
+    const customFonts = await listCustomFontsLocal();
+    const match = customFonts.find((f) => f.family.toLowerCase() === family.toLowerCase());
+    const status = await ensureFontLoaded({
+      family,
+      weight,
+      italic,
+      customUrl: match?.url,
+    });
+    return {
+      available: status.status === 'loaded',
+      family: status.family,
+      resolvedWeight: weight,
+      italic,
+      url: match?.url,
+      source: status.source,
+      exportCompatible: status.availableForExport,
+      error: status.error,
+    };
+  },
+  uploadCustomFont: async (file: File, family?: string) => {
+    validateFontFile(file);
+    const cleanFamily =
+      (family || file.name.replace(/\.[^.]+$/, '')).replace(/[^a-zA-Z0-9 _-]+/g, ' ').trim() ||
+      'Custom Font';
+    const saved = await saveMediaBlob({
+      bucket: 'fonts',
+      filename: file.name,
+      blob: file,
+      mimeType: file.type || 'font/ttf',
+    });
+    const font: SavedFontAsset = {
+      id: uuidv4(),
+      family: cleanFamily,
+      filename: saved.filename,
+      url: saved.uri,
+      createdAt: new Date().toISOString(),
+    };
+    const fonts = await saveCustomFontLocal(font);
+    await ensureFontLoaded({ family: cleanFamily, customUrl: saved.uri });
+    return { font, fonts, exportCompatible: true };
+  },
+  deleteCustomFont: async (id: string) => {
+    const current = await listCustomFontsLocal();
+    const target = current.find((f) => f.id === id);
+    if (target?.url) {
+      await deleteMediaAsset(target.url);
+    }
+    const fonts = await deleteCustomFontLocal(id);
+    return { deleted: Boolean(target), fonts };
+  },
+
+  // Presets (IndexedDB)
+  listPresets: async (category?: PresetCategory) => ({
+    presets: await listPresetsLocal(category),
+  }),
+  createPreset: createPresetLocal,
+  updatePreset: updatePresetLocal,
+  deletePreset: deletePresetLocal,
+  importPresets: importPresetsLocal,
+  downloadPresetsJson: async () => {
+    const presets = await listPresetsLocal();
+    const blob = new Blob([JSON.stringify({ presets }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'recap-studio-presets.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+  },
+
+  // Projects (IndexedDB)
+  listProjects: async () => ({ projects: await listProjectsLocal() }),
+  createProject: async (name: string, presetOpts?: PresetApplyOptions) => {
+    const base = buildDefaultProject(name);
+    const { project, presetWarnings } = await applyPresetsToProjectObject(base, presetOpts);
+    const saved = await saveProjectLocal(project);
+    return { project: saved, presetWarnings };
+  },
+  applyPresetsToProject: async (projectId: string, presetOpts: PresetApplyOptions) => {
+    const existing = await getProjectLocal(projectId);
+    if (!existing) throw new Error('Project not found.');
+    const { project, presetWarnings } = await applyPresetsToProjectObject(existing, presetOpts);
+    const saved = await saveProjectLocal(project);
+    return { project: saved, presetWarnings };
+  },
+  getProject: async (id: string) => {
+    const project = await getProjectLocal(id);
+    if (!project) throw new Error('Project not found.');
+    return { project };
+  },
+  updateProject: async (id: string, patch: Partial<Project>) => ({
+    project: await updateProjectLocal(id, patch),
+  }),
+  deleteProject: async (id: string) => {
+    const existing = await getProjectLocal(id);
+    if (existing) {
+      await deleteProjectMediaAssets(existing);
+    }
+    await deleteProjectLocal(id);
+    return { deleted: true };
+  },
+
+  // Remove Source Video & clean Object URLs in memory
+  removeProjectVideo: async (projectId: string) => {
+    const existing = await getProjectLocal(projectId);
+    if (!existing) throw new Error('Project not found.');
+    if (existing.sourceVideoUrl) await deleteMediaAsset(existing.sourceVideoUrl);
+    if (existing.thumbnailUrl) await deleteMediaAsset(existing.thumbnailUrl);
+    if (existing.lastExportUrl) await deleteMediaAsset(existing.lastExportUrl);
+    const updated = await updateProjectLocal(projectId, {
+      sourceVideoUrl: null,
+      sourceFilename: null,
+      thumbnailUrl: null,
+      metadata: null,
+      waveformPeaks: [],
+      lastExportUrl: null,
+      lastExportSize: null,
+      lastExportedAt: null,
+    });
+    return { project: updated };
+  },
+
+  // Sample Video generated natively in Browser Canvas + Web Audio + MediaRecorder
+  createSampleVideo: async (
+    projectId: string,
+    onProgress?: (pct: number, stage: string) => void
+  ) => {
+    const existing = await getProjectLocal(projectId);
+    if (!existing) throw new Error('Project not found.');
+
+    const synth = await synthesizeBrowserSampleVideo(onProgress);
+    const { metadata, coverBlob, waveformPeaks } = await probeVideoMetadataAndCover(
+      synth.blob,
+      synth.filename,
+      onProgress
     );
+
+    const savedVideo = await saveMediaBlob({
+      bucket: 'video',
+      filename: synth.filename,
+      blob: synth.blob,
+      mimeType: synth.mimeType,
+      existingUrlToRevoke: existing.sourceVideoUrl,
+    });
+
+    let nextThumb: string | null = null;
+    if (coverBlob) {
+      const savedThumb = await saveMediaBlob({
+        bucket: 'thumbs',
+        filename: 'sample_cover.jpg',
+        blob: coverBlob,
+        mimeType: 'image/jpeg',
+        existingUrlToRevoke: existing.thumbnailUrl,
+      });
+      nextThumb = savedThumb.uri;
+    }
+
+    const sampleCaptions = [
+      {
+        id: uuidv4(),
+        start: 0.2,
+        end: 1.4,
+        text: 'At 2:14 AM, the observatory roof dome unlocked from inside.',
+        translatedText: 'At 2:14 AM, the observatory roof dome unlocked from inside.',
+      },
+      {
+        id: uuidv4(),
+        start: 1.5,
+        end: 2.8,
+        text: 'Fourteen minutes of security tape were missing.',
+        translatedText: 'Fourteen minutes of security tape were missing.',
+      },
+      {
+        id: uuidv4(),
+        start: 2.9,
+        end: 4.1,
+        text: 'Nobody entered the vault—someone left it.',
+        translatedText: 'Nobody entered the vault—someone left it.',
+      },
+    ];
+
+    const updated = await updateProjectLocal(projectId, {
+      sourceVideoUrl: savedVideo.uri,
+      sourceFilename: savedVideo.filename,
+      thumbnailUrl: nextThumb,
+      metadata,
+      waveformPeaks,
+      captions: existing.captions.length > 0 ? existing.captions : sampleCaptions,
+    });
+    return { project: updated };
+  },
+
+  // Media Overlays & Tracks (100% Browser File API + IndexedDB)
+  uploadLogo: async (projectId: string, file: File) => {
+    validateImageFile(file, ['png', 'svg', 'jpg', 'jpeg', 'webp']);
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    const saved = await saveMediaBlob({
+      bucket: 'logos',
+      filename: file.name,
+      blob: file,
+      mimeType: file.type || 'image/png',
+    });
+    const logoId = uuidv4();
+    const newLogo = {
+      id: logoId,
+      filename: file.name,
+      url: saved.uri,
+      enabled: true,
+      x: 0.78,
+      y: 0.04,
+      widthPct: 16,
+      opacity: 0.9,
+      rotation: 0,
+      locked: false,
+      permanent: true,
+      startTime: 0,
+      endTime: project.metadata?.duration || 30,
+      presetPosition: 'top-right' as const,
+      motion: { enabled: false, pattern: 'static' as const, speed: 1 },
+    };
+    const nextLogos = [...project.logos, newLogo];
+    const nextCanvas = {
+      ...DEFAULT_VIDEO_CANVAS,
+      ...(project.canvas || {}),
+      layerOrder: [
+        ...(project.canvas?.layerOrder || ['bg-image', 'video']),
+        `logo:${logoId}`,
+      ],
+    };
+    const updated = await updateProjectLocal(projectId, {
+      logos: nextLogos,
+      canvas: nextCanvas,
+    });
+    return { project: updated };
+  },
+
+  uploadCanvasBackground: async (projectId: string, file: File) => {
+    validateImageFile(file, ['png', 'jpg', 'jpeg', 'webp']);
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    const saved = await saveMediaBlob({
+      bucket: 'backgrounds',
+      filename: file.name,
+      blob: file,
+      mimeType: file.type || 'image/jpeg',
+      existingUrlToRevoke: project.canvas?.bgImageUrl,
+    });
+    const nextCanvas = {
+      ...DEFAULT_VIDEO_CANVAS,
+      ...(project.canvas || {}),
+      backgroundType: 'image' as const,
+      bgImageUrl: saved.uri,
+      bgImageFilename: file.name,
+    };
+    const updated = await updateProjectLocal(projectId, { canvas: nextCanvas });
+    return { project: updated, url: saved.uri, filename: file.name };
+  },
+
+  uploadMusic: async (projectId: string, file: File) => {
+    validateAudioFile(file);
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    await probeAudioDuration(file).catch(() => 0);
+    const saved = await saveMediaBlob({
+      bucket: 'audio',
+      filename: file.name,
+      blob: file,
+      mimeType: file.type || 'audio/mpeg',
+      existingUrlToRevoke: project.voice.bgMusicUrl,
+    });
+    const updated = await updateProjectLocal(projectId, {
+      voice: {
+        ...project.voice,
+        bgMusicEnabled: true,
+        bgMusicMuted: false,
+        bgMusicUrl: saved.uri,
+        bgMusicFilename: file.name,
+        bgMusicVolume: project.voice.bgMusicVolume > 0 ? project.voice.bgMusicVolume : 0.3,
+      },
+    });
+    return { project: updated };
+  },
+
+  uploadSfx: async (projectId: string, file: File) => {
+    validateAudioFile(file);
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    const saved = await saveMediaBlob({
+      bucket: 'audio',
+      filename: file.name,
+      blob: file,
+      mimeType: file.type || 'audio/mpeg',
+      existingUrlToRevoke: project.voice.sfxUrl,
+    });
+    const updated = await updateProjectLocal(projectId, {
+      voice: {
+        ...project.voice,
+        sfxEnabled: true,
+        sfxMuted: false,
+        sfxUrl: saved.uri,
+        sfxFilename: file.name,
+        sfxVolume: project.voice.sfxVolume ?? 0.85,
+      },
+    });
+    return { project: updated };
+  },
+
+  uploadMask: async (projectId: string, blurId: string, maskBase64: string) => {
+    const project = await getProjectLocal(projectId);
+    if (!project) throw new Error('Project not found.');
+    const blob = dataUrlToBlob(maskBase64);
+    const existingBlur = project.blurs.find((b) => b.id === blurId);
+    const saved = await saveMediaBlob({
+      bucket: 'masks',
+      filename: `${blurId}.png`,
+      blob,
+      mimeType: 'image/png',
+      existingUrlToRevoke: existingBlur?.maskAssetId,
+    });
+    const nextBlurs = project.blurs.map((b) =>
+      b.id === blurId ? { ...b, maskAssetId: saved.uri } : b
+    );
+    await updateProjectLocal(projectId, { blurs: nextBlurs });
+    return { maskUrl: saved.uri, assetId: saved.uri };
+  },
+
+  extractAudio: async (projectId: string) => {
+    const project = await getProjectLocal(projectId);
+    if (!project || !project.sourceVideoUrl) {
+      throw new Error('No source video available to extract audio.');
+    }
+    return extractBrowserAudioTrack({
+      sourceUri: project.sourceVideoUrl,
+      sourceFilename: project.sourceFilename,
+    });
+  },
+
+  importCaptions: async (projectId: string, content: string) => {
+    const segments = parseSrtOrVtt(content);
+    if (segments.length === 0) {
+      throw new Error('No valid subtitle entries found in SRT/VTT file.');
+    }
+    const updated = await updateProjectLocal(projectId, {
+      captions: segments,
+    });
+    return { project: updated, count: segments.length };
+  },
+
+  downloadSubtitlesFile: async (project: Project, format: 'srt' | 'vtt') => {
+    const content =
+      format === 'srt'
+        ? generateSrtContent(project.captions)
+        : generateVttContent(project.captions);
+    const blob = new Blob([content], {
+      type: format === 'srt' ? 'application/x-subrip' : 'text/vtt',
+    });
+    const url = URL.createObjectURL(blob);
+    const safeName = (project.name || 'subtitles').replace(/[^a-zA-Z0-9._-]+/g, '_');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeName}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+  },
+
+  generateThumbnails: async (projectId: string) => {
+    const project = await getProjectLocal(projectId);
+    if (!project || !project.sourceVideoUrl) {
+      throw new Error('No source video available to extract thumbnails.');
+    }
+    const sourceUri = project.lastExportUrl || project.sourceVideoUrl;
+    const isFinal = Boolean(project.lastExportUrl);
+    const thumbnails = await extractBrowserThumbnailFrames({
+      sourceUri,
+      canvas: isFinal ? undefined : project.canvas,
+      videoEffects: isFinal ? undefined : project.videoEffects,
+    });
+
+    // Derive suggested titles strictly from project.name and segment.translatedText (NEVER seg.text)
+    const translatedLines = project.captions
+      .map((c) => (c.translatedText || '').trim())
+      .filter(Boolean);
+    const shortHooks = translatedLines
+      .map((line) => {
+        const words = line.split(/\s+/).slice(0, 6).join(' ');
+        return words.length > 36 ? `${words.slice(0, 35)}…` : words;
+      })
+      .filter(Boolean);
+
+    const suggestedTitle = shortHooks[0] || project.name || 'Movie Recap';
+    const suggestedTitles = Array.from(
+      new Set([
+        suggestedTitle,
+        shortHooks[1] || `${project.name} Explained`,
+        shortHooks[2] || `Shocking Ending · ${project.name}`,
+        shortHooks[3] || `The Truth Behind ${project.name}`,
+        shortHooks[4] || `${project.name} Full Story`,
+      ])
+    ).slice(0, 5);
+
+    return {
+      thumbnails,
+      sourceMode: isFinal ? ('final-export' as const) : ('edited-source' as const),
+      suggestedTitle,
+      suggestedSubtitle: translatedLines[0] || '',
+      suggestedTitles,
+      translationMissingWarning: translatedLines.length === 0,
+    };
+  },
+
+  // Export Pipeline (100% Browser Canvas + Web Audio + MediaRecorder)
+  startExport: async (projectId: string, exportSettings: Project['exportSettings']) => {
+    const project = await getProjectLocal(projectId);
+    if (!project || !project.sourceVideoUrl) {
+      throw new Error('Source video is missing from browser storage.');
+    }
+
+    const jobId = uuidv4();
+    const now = new Date().toISOString();
+    const initialJob: RenderJob = {
+      id: jobId,
+      projectId,
+      type: 'render',
+      status: 'processing',
+      progress: 1,
+      stage: 'Preparing browser video render pipeline...',
+      etaSeconds: Math.ceil(project.metadata?.duration || 10),
+      outputUrl: null,
+      outputSize: null,
+      error: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await upsertJobLocal(initialJob);
+
+    // Run async render loop in browser and update IndexedDB job record cleanly
+    void (async () => {
+      try {
+        const result = await renderProjectInBrowser({
+          project,
+          settings: exportSettings,
+          onProgress: (pct, stage, etaSeconds) => {
+            void upsertJobLocal({
+              ...initialJob,
+              status: 'processing',
+              progress: pct,
+              stage,
+              etaSeconds,
+              updatedAt: new Date().toISOString(),
+            });
+          },
+        });
+
+        await updateProjectLocal(projectId, {
+          exportSettings,
+          lastExportUrl: result.outputUri,
+          lastExportSize: result.sizeBytes,
+          lastExportedAt: new Date().toISOString(),
+        });
+
+        await upsertJobLocal({
+          ...initialJob,
+          status: 'completed',
+          progress: 100,
+          stage: `Rendered in browser (${result.width}×${result.height})`,
+          etaSeconds: 0,
+          outputUrl: result.outputUri,
+          outputSize: result.sizeBytes,
+          error: null,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        await upsertJobLocal({
+          ...initialJob,
+          status: 'failed',
+          progress: 0,
+          stage: 'Browser export failed',
+          etaSeconds: null,
+          error: err instanceof Error ? err.message : String(err),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    })();
+
+    return { job: initialJob };
+  },
+
+  listProjectJobs: async (projectId: string) => ({
+    jobs: await listProjectJobsLocal(projectId),
+  }),
+  getJob: async (jobId: string) => {
+    const job = await getJobLocal(jobId);
+    if (!job) throw new Error('Render job not found.');
+    return { job };
+  },
+  listAllJobs: async () => ({ jobs: await listAllJobsLocal() }),
+
+  // Automated Server-Side Key-Protected AI Calls (never expose GEMINI_API_KEY / FISH_API_KEY in frontend)
+  translate: async (
+    projectId: string,
+    targetLanguage: SupportedLanguage,
+    preserveProperNouns: boolean
+  ) => {
+    const localProject = await getProjectLocal(projectId);
+    if (!localProject) throw new Error('Project not found.');
+    const res = await aiBackendRequest<{ project: Project }>(`/api/projects/${projectId}/translate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetLanguage,
+        preserveProperNouns,
+        captions: localProject.captions,
+        sourceLanguage: localProject.translation.sourceLanguage,
+      }),
+    });
+    const merged = await updateProjectLocal(projectId, {
+      captions: res.project.captions,
+      translation: res.project.translation,
+      subtitleStyle: res.project.subtitleStyle,
+    });
+    return { project: merged };
   },
 
   listFishVoices: (params?: { query?: string; selfOnly?: boolean; language?: string }) => {
@@ -221,215 +953,13 @@ export const api = {
     if (params?.selfOnly) qs.set('self', 'true');
     if (params?.language) qs.set('language', params.language);
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
-    return request<{ voices: FishVoiceModel[]; total: number }>(`/api/fish/voices${suffix}`);
-  },
-
-  listSavedFishVoices: () =>
-    request<{ voices: SavedFishVoice[] }>('/api/fish/saved-voices'),
-
-  createSavedFishVoice: (params: { name: string; voiceId: string; isDefault?: boolean }) =>
-    request<{ voice: SavedFishVoice; voices: SavedFishVoice[] }>('/api/fish/saved-voices', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
-
-  updateSavedFishVoice: (
-    id: string,
-    params: { name?: string; voiceId?: string; isDefault?: boolean }
-  ) =>
-    request<{ voice: SavedFishVoice; voices: SavedFishVoice[] }>(`/api/fish/saved-voices/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
-
-  deleteSavedFishVoice: (id: string) =>
-    request<{ deleted: boolean; voices: SavedFishVoice[] }>(`/api/fish/saved-voices/${id}`, {
-      method: 'DELETE',
-    }),
-
-  listCustomFonts: () => request<{ fonts: SavedFontAsset[] }>('/api/fonts'),
-
-  getFontCatalog: () =>
-    request<{ builtin: FontCatalogItem[]; custom: SavedFontAsset[] }>('/api/fonts/catalog'),
-
-  ensureFont: (family: string, weight = 700, italic = false) =>
-    request<{
-      available: boolean;
-      family: string;
-      resolvedWeight: number;
-      italic: boolean;
-      url?: string;
-      source?: 'builtin' | 'custom' | 'system';
-      exportCompatible?: boolean;
-      error?: string;
-    }>(
-      `/api/fonts/ensure?family=${encodeURIComponent(family)}&weight=${weight}&italic=${italic ? '1' : '0'}`
-    ),
-
-  uploadCustomFont: async (file: File, family?: string) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    if (family) fd.append('family', family);
-    return request<{ font: SavedFontAsset; fonts: SavedFontAsset[]; exportCompatible?: boolean }>(
-      '/api/fonts',
-      {
-        method: 'POST',
-        body: fd,
-      }
+    return aiBackendRequest<{ voices: FishVoiceModel[]; total: number }>(
+      `/api/fish/voices${suffix}`
     );
   },
-
-  deleteCustomFont: (id: string) =>
-    request<{ deleted: boolean; fonts: SavedFontAsset[] }>(`/api/fonts/${id}`, {
-      method: 'DELETE',
-    }),
-
-  listPresets: (category?: PresetCategory) =>
-    request<{ presets: StudioPreset[] }>(
-      category ? `/api/presets?category=${encodeURIComponent(category)}` : '/api/presets'
-    ),
-
-  createPreset: (params: {
-    category: PresetCategory;
-    name: string;
-    description?: string;
-    isDefault?: boolean;
-    thumbnailStyle?: StudioPreset['thumbnailStyle'];
-    payload: Record<string, unknown>;
-    assetRefs?: StudioPresetAssetRef[];
-  }) =>
-    request<{ preset: StudioPreset; presets: StudioPreset[] }>('/api/presets', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
-
-  updatePreset: (
-    id: string,
-    patch: Partial<{
-      name: string;
-      description: string;
-      isDefault: boolean;
-      thumbnailStyle: StudioPreset['thumbnailStyle'];
-      payload: Record<string, unknown>;
-      assetRefs: StudioPresetAssetRef[];
-    }>
-  ) =>
-    request<{ preset: StudioPreset; presets: StudioPreset[] }>(`/api/presets/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    }),
-
-  deletePreset: (id: string) =>
-    request<{ deleted: boolean; presets: StudioPreset[] }>(`/api/presets/${id}`, {
-      method: 'DELETE',
-    }),
-
-  importPresets: (bundle: unknown) =>
-    request<{ importedCount: number; imported: StudioPreset[]; presets: StudioPreset[] }>(
-      '/api/presets/import',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(bundle),
-      }
-    ),
-
-  exportPresetsUrl: resolveApiUrl('/api/presets/export'),
-
-  listProjects: () => request<{ projects: Project[] }>('/api/projects'),
-
-  createProject: (name: string, presetOpts?: PresetApplyOptions) =>
-    request<{ project: Project; presetWarnings?: PresetWarning[] }>('/api/projects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, ...(presetOpts || {}) }),
-    }),
-
-  applyPresetsToProject: (projectId: string, presetOpts: PresetApplyOptions) =>
-    request<{ project: Project; presetWarnings?: PresetWarning[] }>(
-      `/api/projects/${projectId}/apply-presets`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(presetOpts),
-      }
-    ),
-
-  getProject: (id: string) => request<{ project: Project }>(`/api/projects/${id}`),
-
-  updateProject: (id: string, patch: Partial<Project>) =>
-    request<{ project: Project }>(`/api/projects/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    }),
-
-  deleteProject: (id: string) =>
-    request<{ deleted: boolean }>(`/api/projects/${id}`, { method: 'DELETE' }),
-
-  createSampleVideo: (projectId: string) =>
-    request<{ project: Project }>(`/api/projects/${projectId}/sample-video`, {
-      method: 'POST',
-    }),
-
-  uploadLogo: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project }>(`/api/projects/${projectId}/logo`, {
-      method: 'POST',
-      body: fd,
-    });
-  },
-
-  uploadCanvasBackground: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project; url: string; filename: string }>(
-      `/api/projects/${projectId}/canvas-bg`,
-      {
-        method: 'POST',
-        body: fd,
-      }
-    );
-  },
-
-  uploadMusic: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project }>(`/api/projects/${projectId}/music`, {
-      method: 'POST',
-      body: fd,
-    });
-  },
-
-  uploadSfx: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project }>(`/api/projects/${projectId}/sfx`, {
-      method: 'POST',
-      body: fd,
-    });
-  },
-
-  uploadMask: (projectId: string, blurId: string, maskBase64: string) =>
-    request<{ maskUrl: string; assetId: string }>(`/api/projects/${projectId}/mask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ blurId, maskBase64 }),
-    }),
-
-  extractAudio: (projectId: string) =>
-    request<{ audioUrl: string; downloadUrl: string; filename: string }>(
-      `/api/projects/${projectId}/audio/extract`,
-      { method: 'POST' }
-    ),
 
   transcribe: (projectId: string, params?: { provider?: 'fish' | 'gemini'; sourceLanguage?: string }) =>
-    request<{ project: Project; detectedLanguage: string; segmentCount: number }>(
+    aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
       `/api/projects/${projectId}/transcribe`,
       {
         method: 'POST',
@@ -439,7 +969,7 @@ export const api = {
     ),
 
   transcribeWithFish: (projectId: string, sourceLanguage?: string) =>
-    request<{ project: Project; detectedLanguage: string; segmentCount: number }>(
+    aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
       `/api/projects/${projectId}/dubbing/transcribe`,
       {
         method: 'POST',
@@ -448,29 +978,11 @@ export const api = {
       }
     ),
 
-  importCaptions: (projectId: string, content: string) =>
-    request<{ project: Project; count: number }>(`/api/projects/${projectId}/captions/import`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
-    }),
-
-  translate: (
-    projectId: string,
-    targetLanguage: SupportedLanguage,
-    preserveProperNouns: boolean
-  ) =>
-    request<{ project: Project }>(`/api/projects/${projectId}/translate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ targetLanguage, preserveProperNouns }),
-    }),
-
   previewFishDub: (
     projectId: string,
     params: { text: string; referenceId?: string; speakingSpeed: number }
   ) =>
-    request<{ audioUrl: string }>(`/api/projects/${projectId}/dubbing/preview`, {
+    aiBackendRequest<{ audioUrl: string }>(`/api/projects/${projectId}/dubbing/preview`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -478,19 +990,16 @@ export const api = {
 
   generateFishDub: (
     projectId: string,
-    params: { voice: Project['voice']; captions?: CaptionSegment[]; useTranslated?: boolean }
+    params: { voice: Project['voice']; captions?: Project['captions']; useTranslated?: boolean }
   ) =>
-    request<{ job: RenderJob }>(
-      `/api/projects/${projectId}/dubbing/generate`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      }
-    ),
+    aiBackendRequest<{ job: RenderJob }>(`/api/projects/${projectId}/dubbing/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    }),
 
   resyncFishDub: (projectId: string, syncMode: SyncMode, continuousPauseMs?: number) =>
-    request<{ project: Project }>(`/api/projects/${projectId}/dubbing/resync`, {
+    aiBackendRequest<{ project: Project }>(`/api/projects/${projectId}/dubbing/resync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ syncMode, continuousPauseMs }),
@@ -500,12 +1009,12 @@ export const api = {
     projectId: string,
     params: {
       segmentIds: string[];
-      captions?: CaptionSegment[];
+      captions?: Project['captions'];
       voice?: Partial<Project['voice']>;
       useTranslated?: boolean;
     }
   ) =>
-    request<{
+    aiBackendRequest<{
       project: Project;
       regeneratedIds: string[];
       fullDubUrl: string;
@@ -525,7 +1034,7 @@ export const api = {
       speakingSpeed: number;
     }
   ) =>
-    request<{ audioUrl: string }>(`/api/projects/${projectId}/voice/preview`, {
+    aiBackendRequest<{ audioUrl: string }>(`/api/projects/${projectId}/voice/preview`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -535,7 +1044,7 @@ export const api = {
     projectId: string,
     params: { voice: Project['voice']; useTranslated: boolean }
   ) =>
-    request<{ project: Project; fullDubUrl: string }>(
+    aiBackendRequest<{ project: Project; fullDubUrl: string }>(
       `/api/projects/${projectId}/voice/generate`,
       {
         method: 'POST',
@@ -548,7 +1057,7 @@ export const api = {
     projectId: string,
     params: { voice: Project['voice']; preserveProperNouns?: boolean }
   ) =>
-    request<{
+    aiBackendRequest<{
       project: Project;
       sourceLanguage: string;
       targetLanguage: SupportedLanguage;
@@ -558,148 +1067,7 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     }),
-
-  generateThumbnails: (projectId: string) =>
-    request<{
-      thumbnails: string[];
-      sourceMode?: 'final-export' | 'edited-source';
-      suggestedTitle: string;
-      suggestedSubtitle: string;
-      suggestedTitles?: string[];
-      translationMissingWarning?: boolean;
-    }>(`/api/projects/${projectId}/thumbnails/generate`, { method: 'POST' }),
-
-  startExport: (projectId: string, exportSettings: Project['exportSettings']) =>
-    request<{ job: RenderJob }>(`/api/projects/${projectId}/export`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ exportSettings }),
-    }),
-
-  listProjectJobs: (projectId: string) =>
-    request<{ jobs: RenderJob[] }>(`/api/projects/${projectId}/jobs`),
-
-  getJob: (jobId: string) => request<{ job: RenderJob }>(`/api/jobs/${jobId}`),
-
-  listAllJobs: () => request<{ jobs: RenderJob[] }>('/api/jobs'),
-
-  uploadVideoDirect: (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project; metadata: VideoMetadata }>(`/api/projects/${projectId}/video`, {
-      method: 'POST',
-      body: fd,
-    });
-  },
 };
 
-export async function uploadVideoChunked(params: {
-  projectId: string;
-  file: File;
-  onProgress: (pct: number, stage: string) => void;
-}): Promise<Project> {
-  const { projectId, file, onProgress } = params;
-  if (!file || file.size <= 0) {
-    throw new Error('Selected video file is empty (0 bytes). Please select a valid video file.');
-  }
-
-  const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunks (safe across reverse-proxy body limits)
-  const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-
-  onProgress(2, 'Initializing chunked upload...');
-  const initRes = await request<{ uploadId: string; totalChunks: number }>('/api/uploads/init', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      projectId,
-      filename: file.name,
-      totalSize: file.size,
-      totalChunks,
-    }),
-  });
-
-  const maxChunkRetries = 3;
-
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(file.size, start + CHUNK_SIZE);
-    const slice = file.slice(start, end);
-    const buffer = await slice.arrayBuffer();
-    const chunkUrl = resolveApiUrl(`/api/uploads/${initRes.uploadId}/chunk?index=${i}`);
-
-    let uploadedChunk = false;
-    let lastErr: Error | null = null;
-
-    for (let attempt = 1; attempt <= maxChunkRetries; attempt++) {
-      try {
-        const chunkRes = await fetch(chunkUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: buffer,
-        });
-        if (!chunkRes.ok) {
-          const rawErr = await chunkRes.text().catch(() => '');
-          let parsedErr = '';
-          if (rawErr) {
-            try {
-              const json = JSON.parse(rawErr) as { error?: string };
-              if (typeof json.error === 'string') parsedErr = json.error;
-            } catch {
-              parsedErr = rawErr.slice(0, 180);
-            }
-          }
-          if (chunkRes.status === 405) {
-            throw new Error(
-              `Chunk ${i + 1} upload failed (405 Method Not Allowed): Cloudflare Pages does not support POST requests on static routes. Please set BACKEND_URL in Cloudflare Pages or VITE_API_BASE_URL to point to your Node.js Express server.`
-            );
-          }
-          const retryable = chunkRes.status >= 500 || chunkRes.status === 429;
-          const msg = parsedErr || `Chunk ${i + 1} upload failed (${chunkRes.status})`;
-          if (retryable && attempt < maxChunkRetries) {
-            lastErr = new Error(msg);
-            onProgress(
-              Math.round(5 + (i / totalChunks) * 80),
-              `Retrying chunk ${i + 1} of ${totalChunks} (attempt ${attempt + 1}/${maxChunkRetries})...`
-            );
-            await new Promise((r) => setTimeout(r, 600 * attempt));
-            continue;
-          }
-          throw new Error(msg);
-        }
-        uploadedChunk = true;
-        break;
-      } catch (err) {
-        lastErr = err instanceof Error ? err : new Error(String(err));
-        if (attempt < maxChunkRetries && !lastErr.message.includes('405')) {
-          onProgress(
-            Math.round(5 + (i / totalChunks) * 80),
-            `Retrying chunk ${i + 1} of ${totalChunks} (attempt ${attempt + 1}/${maxChunkRetries})...`
-          );
-          await new Promise((r) => setTimeout(r, 600 * attempt));
-          continue;
-        }
-        throw lastErr;
-      }
-    }
-
-    if (!uploadedChunk) {
-      throw lastErr || new Error(`Chunk ${i + 1} upload failed.`);
-    }
-
-    const pct = Math.round(5 + ((i + 1) / totalChunks) * 80);
-    onProgress(pct, `Uploading chunk ${i + 1} of ${totalChunks}...`);
-  }
-
-  onProgress(90, 'Analyzing video streams & extracting audio waveform...');
-  const completeRes = await request<{ project: Project }>(
-    `/api/uploads/${initRes.uploadId}/complete`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId }),
-    }
-  );
-
-  onProgress(100, 'Upload complete');
-  return completeRes.project;
-}
+// Re-export helper for direct usage
+export { getMediaBlob };

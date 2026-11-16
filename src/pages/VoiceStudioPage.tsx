@@ -621,7 +621,8 @@ export function VoiceStudioPage({
                       Synchronized Full Dub Track ({voice.generatedClips.length} segments)
                     </span>
                     <a
-                      href={resolveApiUrl(`${voice.fullDubUrl}?download=1`)}
+                      href={resolveApiUrl(voice.fullDubUrl)}
+                      download={`${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_dub.mp3`}
                       className="text-[11px] font-mono text-violet-300 hover:text-violet-200"
                     >
                       Download MP3

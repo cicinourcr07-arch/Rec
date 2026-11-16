@@ -1,6 +1,7 @@
 import JSZip from 'jszip';
 import { Project } from '../types/studio';
 import { api, LocalAssetManifestItem, resolveApiUrl } from './api';
+import { getMediaBlob, isLocalMediaUri } from './browserMediaStore';
 import { indexedDbStore } from './indexedDbStore';
 
 interface BackupManifestFile {
@@ -39,9 +40,11 @@ export async function exportProjectBackupZip(
 
     let blob: Blob | null = null;
     try {
-      const resp = await fetch(resolveApiUrl(asset.localUrl));
-      if (resp.ok) {
-        blob = await resp.blob();
+      if (isLocalMediaUri(asset.localUrl)) {
+        blob = await getMediaBlob(asset.localUrl);
+      } else {
+        const resp = await fetch(resolveApiUrl(asset.localUrl));
+        if (resp.ok) blob = await resp.blob();
       }
     } catch {
       const cached = asset.sha256 ? await indexedDbStore.getCachedMedia(asset.sha256) : null;

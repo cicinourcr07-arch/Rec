@@ -2377,20 +2377,22 @@ export function CaptionsPage({
 
         {project.captions.length > 0 && (
           <div className="flex items-center gap-2">
-            <a
-              href={resolveApiUrl(`/api/projects/${project.id}/subtitles/srt`)}
+            <button
+              type="button"
+              onClick={() => void api.downloadSubtitlesFile(project, 'srt')}
               className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1 cursor-pointer"
             >
               <Download className="w-3 h-3" />
               SRT
-            </a>
-            <a
-              href={resolveApiUrl(`/api/projects/${project.id}/subtitles/vtt`)}
+            </button>
+            <button
+              type="button"
+              onClick={() => void api.downloadSubtitlesFile(project, 'vtt')}
               className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1 cursor-pointer"
             >
               <Download className="w-3 h-3" />
               VTT
-            </a>
+            </button>
           </div>
         )}
       </div>
