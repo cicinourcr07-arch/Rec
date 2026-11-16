@@ -34,37 +34,35 @@
 
 ## Architecture
 
-- **Frontend**: `src/` (React 19, TypeScript, Tailwind CSS v4, Lucide Icons)
-- **Backend Services**: `server.ts` + `server/services/`
-  - `video_upload_service.ts`
-  - `video_analysis_service.ts`
-  - `transcription_service.ts`
-  - `translation_service.ts`
-  - `voice_generation_service.ts`
-  - `blur_processing_service.ts`
-  - `logo_overlay_service.ts`
-  - `subtitle_service.ts`
-  - `audio_processing_service.ts`
-  - `video_render_service.ts`
-  - `export_service.ts`
-- **Database**: SQLite (`db/schema.sql`, `server/db.ts`)
-- **Optional Python FastAPI + OpenCV Worker**: `python_backend/main.py`
+- **Frontend**: `src/` (React 19, TypeScript, Tailwind CSS v4, Lucide Icons) — handles all video selection, preview, frame extraction, audio extraction, subtitles, and rendering locally in the browser via File API, Canvas, Web Audio, MediaRecorder, and IndexedDB.
+- **Cloudflare Worker Backend + Static Assets**: `wrangler.jsonc` + `worker/index.ts` (plus `functions/api/[[catchall]].ts` fallback for Pages) — serves `./dist` static assets via `env.ASSETS` and executes `/api/fish-audio` and `/api/fish/*` using `env.FISH_AUDIO_API_KEY`.
+- **Local Express Dev Server**: `server.ts` + `server/services/` (port `3000`)
 
 ## Environment Variables
 
-Configure via a local `.env` file (ignored by Git via `.gitignore`) or your hosting provider's environment variables / Secrets panel (never expose secret keys in `VITE_*` variables):
+Configure via a local `.env` file (ignored by Git via `.gitignore`) for local development, or in Cloudflare Worker **Variables and Secrets** for production (never expose secret keys in `VITE_*` variables):
 
-- `FISH_AUDIO_API_KEY`: Required on the backend for Fish Audio ASR transcription, voice library browsing, and `s2.1-pro-free` MP3 dubbing (`/api/fish/*`, `/api/projects/:id/dubbing/*`).
+- `FISH_AUDIO_API_KEY`: Required on the Worker/backend for Fish Audio TTS (`/api/fish-audio`), ASR transcription (`/api/fish/asr`), and voice library browsing (`/api/fish/voices`).
 - `FISH_API_BASE_URL`: Optional Fish Audio API base URL (default `https://api.fish.audio`).
-- `GEMINI_API_KEY`: Required for server-side automated AI translation.
-- `STORAGE_DIR`: Directory for temporary audio/server assets (default `./storage`).
+- `GEMINI_API_KEY`: Optional key for server-side automated AI translation.
 
-### Deploying with Fish Audio API
+### Deploying to Cloudflare Workers + Static Assets (Recommended via GitHub)
 
-If you deploy the Express backend to a hosting provider (e.g. Render, Railway, Cloud Run, or Fly.io):
-1. Open your backend service **Environment Variables** (or **Secrets**) panel.
-2. Add `FISH_AUDIO_API_KEY` with your Fish Audio key (do **not** prefix it with `VITE_`).
-3. On your Cloudflare Pages frontend project, set `VITE_API_BASE_URL` to your deployed backend URL (e.g. `https://your-backend.onrender.com`) so Fish Audio requests proxy through the backend without ever exposing the API key in the browser.
+This repository includes `wrangler.jsonc` configured with `"main": "worker/index.ts"` and `"assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/health"] }`, allowing you to deploy both the Vite SPA and `/api/fish-audio` Worker backend together—and add environment secrets cleanly in Cloudflare.
+
+1. Push this repository to GitHub (`.env` is excluded by `.gitignore`).
+2. In the **Cloudflare Dashboard** → **Compute (Workers)** → **Workers & Pages** → **Create** → **Import a repository** (connect your GitHub repo).
+3. Configure the build settings:
+   - **Build command**: `npm run build`
+   - **Deploy command**: `npx wrangler deploy`
+   - **Root directory**: `/` (leave default)
+4. Click **Deploy** once to create the Worker.
+5. Open your Worker → **Settings** → **Variables and Secrets** → **+ Add**:
+   - Type: **Secret**
+   - Variable name: `FISH_AUDIO_API_KEY`
+   - Value: your actual Fish Audio API key
+   - Click **Deploy / Save** (Cloudflare will redeploy with `env.FISH_AUDIO_API_KEY` active).
+   - *(CLI alternative)*: run `npm run build && npx wrangler secret put FISH_AUDIO_API_KEY && npx wrangler deploy`.
 
 ## Running Locally
 
@@ -79,4 +77,5 @@ If you deploy the Express backend to a hosting provider (e.g. Render, Railway, C
    ```
 
 The server listens on `http://localhost:3000`.
+
 

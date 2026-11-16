@@ -404,7 +404,7 @@ app.get('/api/fish/status', (_req, res) => {
   });
 });
 
-app.post('/api/fish/tts', async (req, res) => {
+app.post(['/api/fish-audio', '/api/fish/tts'], async (req, res) => {
   try {
     const text = String(req.body?.text || '').trim();
     if (!text) {

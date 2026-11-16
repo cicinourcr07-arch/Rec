@@ -1,14 +1,12 @@
 /**
- * Cloudflare Pages Function: Proxy /api/* requests to the Node.js Express backend.
- *
- * Cloudflare Pages only hosts static frontend files. The Express + Multer + SQLite + FFmpeg
- * backend must run in a Node.js environment (e.g., Google Cloud Run, Railway, Render, Fly.io, or VPS).
- *
- * Configure BACKEND_URL (or VITE_API_BASE_URL) in your Cloudflare Pages dashboard under
- * Settings -> Environment Variables.
+ * Cloudflare Pages Function fallback for /api/* requests.
+ * If BACKEND_URL is not configured, executes the built-in Edge Worker handler
+ * (including /api/fish-audio using env.FISH_AUDIO_API_KEY) directly.
  */
 
-interface Env {
+import { Env, handleApiRequest } from '../../worker/index.ts';
+
+interface PagesEnv extends Env {
   BACKEND_URL?: string;
   VITE_API_BASE_URL?: string;
   API_URL?: string;
@@ -16,7 +14,7 @@ interface Env {
 
 export const onRequest = async (context: {
   request: Request;
-  env: Env;
+  env: PagesEnv;
   params: { catchall?: string[] };
 }): Promise<Response> => {
   const { request, env } = context;
@@ -27,9 +25,10 @@ export const onRequest = async (context: {
     ''
   ).replace(/\/+$/, '');
 
-  const url = new URL(request.url);
+  if (!backendBase) {
+    return handleApiRequest(request, env);
+  }
 
-  // Handle CORS preflight directly at Cloudflare Edge
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -45,27 +44,7 @@ export const onRequest = async (context: {
     });
   }
 
-  // If no backend is configured, return an actionable JSON response instead of a static 405 error
-  if (!backendBase) {
-    return new Response(
-      JSON.stringify({
-        error:
-          'Backend server URL is not configured. Cloudflare Pages only hosts the static frontend and cannot run Express, Multer, SQLite, or FFmpeg natively. Please configure the "BACKEND_URL" environment variable in your Cloudflare Pages project settings with the URL of your deployed Node.js backend server (e.g., Cloud Run, Render, or Railway).',
-        code: 'BACKEND_NOT_CONFIGURED',
-        path: url.pathname,
-        method: request.method,
-      }),
-      {
-        status: 503,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      }
-    );
-  }
-
-  // Forward the request (including streaming video upload chunks and multipart data) to Express
+  const url = new URL(request.url);
   const targetUrl = `${backendBase}${url.pathname}${url.search}`;
   const forwardHeaders = new Headers(request.headers);
   forwardHeaders.delete('host');

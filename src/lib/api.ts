@@ -57,6 +57,17 @@ import {
   renderProjectInBrowser,
 } from './browserVideoExporter';
 import {
+  fetchFishAudioFromEndpoint,
+  generateEdgeFishDubbing,
+  renderMergedDubWavFromClips,
+} from './browserAudioDubbing';
+import {
+  applySyncPlanToClips,
+  buildTimelineSyncPlan,
+  clampContinuousPauseMs,
+  normalizeSyncMode,
+} from '../../server/services/timeline_sync_service';
+import {
   applyPresetsToProjectObject,
   buildDefaultProject,
   ClientPresetApplyOptions,
@@ -89,6 +100,8 @@ import {
 
 export type PresetApplyOptions = ClientPresetApplyOptions;
 export type PresetWarning = ClientPresetWarning;
+
+const edgeVoiceJobIds = new Set<string>();
 
 export interface LocalAssetManifestItem {
   localUrl: string;
@@ -916,7 +929,13 @@ export const api = {
   }),
   getJob: async (jobId: string) => {
     const localJob = await getJobLocal(jobId);
-    if (localJob && (localJob.status === 'completed' || localJob.status === 'failed' || localJob.type !== 'voice')) {
+    if (
+      localJob &&
+      (edgeVoiceJobIds.has(jobId) ||
+        localJob.status === 'completed' ||
+        localJob.status === 'failed' ||
+        localJob.type !== 'voice')
+    ) {
       return { job: localJob };
     }
     const res = await aiBackendRequest<{
@@ -1047,33 +1066,208 @@ export const api = {
     };
   },
 
-  previewFishDub: (
+  generateFishAudio: async (params: {
+    text: string;
+    referenceId?: string;
+    format?: 'mp3' | 'wav' | 'pcm' | 'opus';
+  }) => {
+    const audioBlob = await fetchFishAudioFromEndpoint({
+      endpointUrl: resolveApiUrl('/api/fish-audio'),
+      text: params.text,
+      referenceId: params.referenceId,
+      format: params.format || 'mp3',
+    });
+    const saved = await saveMediaBlob({
+      bucket: 'audio',
+      filename: `fish_audio_${Date.now()}.${params.format || 'mp3'}`,
+      blob: audioBlob,
+      mimeType: audioBlob.type || 'audio/mpeg',
+    });
+    return { audioUrl: saved.uri, blob: audioBlob };
+  },
+
+  previewFishDub: async (
     projectId: string,
     params: { text: string; referenceId?: string; speakingSpeed: number }
-  ) =>
-    aiBackendRequest<{ audioUrl: string }>(`/api/projects/${projectId}/dubbing/preview`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
+  ) => {
+    const audioBlob = await fetchFishAudioFromEndpoint({
+      endpointUrl: resolveApiUrl('/api/fish-audio'),
+      text: params.text,
+      referenceId: params.referenceId,
+      format: 'mp3',
+    });
+    const saved = await saveMediaBlob({
+      bucket: 'audio',
+      filename: `fish_preview_${projectId.slice(0, 8)}_${Date.now()}.mp3`,
+      blob: audioBlob,
+      mimeType: 'audio/mpeg',
+    });
+    return { audioUrl: saved.uri };
+  },
 
   generateFishDub: async (
     projectId: string,
     params: { voice: Project['voice']; captions?: Project['captions']; useTranslated?: boolean }
   ) => {
     const localProject = await getProjectLocal(projectId);
-    return aiBackendRequest<{ job: RenderJob }>(`/api/projects/${projectId}/dubbing/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...params,
-        totalDuration: localProject?.metadata?.duration,
-      }),
-    });
+    const res = await aiBackendRequest<{ job?: RenderJob; workerEdgeMode?: boolean }>(
+      `/api/projects/${projectId}/dubbing/generate`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...params,
+          totalDuration: localProject?.metadata?.duration,
+        }),
+      }
+    );
+
+    if (res.job && !res.workerEdgeMode) {
+      return { job: res.job };
+    }
+
+    if (!localProject) {
+      throw new Error('Project not found in browser storage.');
+    }
+
+    const now = new Date().toISOString();
+    const captions = params.captions || localProject.captions;
+    const jobId = uuidv4();
+    edgeVoiceJobIds.add(jobId);
+    const initialJob: RenderJob = {
+      id: jobId,
+      projectId,
+      type: 'voice',
+      status: 'processing',
+      progress: 2,
+      stage: 'Synthesizing Fish Audio segments via Worker (/api/fish-audio)...',
+      etaSeconds: null,
+      outputUrl: null,
+      outputSize: null,
+      error: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await upsertJobLocal(initialJob);
+
+    void (async () => {
+      try {
+        const result = await generateEdgeFishDubbing({
+          project: localProject,
+          captions,
+          voiceConfig: params.voice,
+          useTranslated: params.useTranslated ?? true,
+          fishEndpointUrl: resolveApiUrl('/api/fish-audio'),
+          onProgress: (progress, stage, etaSeconds) => {
+            void upsertJobLocal({
+              ...initialJob,
+              status: 'processing',
+              progress,
+              stage,
+              etaSeconds,
+              updatedAt: new Date().toISOString(),
+            });
+          },
+        });
+
+        await updateProjectLocal(projectId, {
+          captions,
+          voice: {
+            ...localProject.voice,
+            ...params.voice,
+            provider: 'fish',
+            syncMode: result.syncPlan.syncMode,
+            continuousPauseMs:
+              result.syncPlan.pauseDurationMs ?? params.voice.continuousPauseMs,
+            speakingSpeed: 1.0,
+            enabled: true,
+            generatedClips: result.clips,
+            fullDubUrl: result.fullDubUrl,
+            syncPlan: result.syncPlan,
+          },
+        });
+
+        await upsertJobLocal({
+          ...initialJob,
+          status: 'completed',
+          progress: 100,
+          stage: `Generated all ${result.clips.length} synchronized segments`,
+          etaSeconds: 0,
+          outputUrl: result.fullDubUrl,
+          outputSize: null,
+          error: null,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        await upsertJobLocal({
+          ...initialJob,
+          status: 'failed',
+          progress: 0,
+          stage: 'Fish Audio dubbing failed',
+          etaSeconds: null,
+          error: err instanceof Error ? err.message : String(err),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    })();
+
+    return { job: initialJob };
   },
 
   resyncFishDub: async (projectId: string, syncMode: SyncMode, continuousPauseMs?: number) => {
     const localProject = await getProjectLocal(projectId);
+    if (!localProject) throw new Error('Project not found.');
+
+    const existingClips = localProject.voice.generatedClips || [];
+    const allClipsLocal =
+      existingClips.length > 0 && existingClips.every((c) => isLocalMediaUri(c.audioUrl));
+
+    if (allClipsLocal) {
+      const normalizedMode = normalizeSyncMode(syncMode);
+      const pauseMs = clampContinuousPauseMs(
+        continuousPauseMs ?? localProject.voice.continuousPauseMs
+      );
+      const captionById = new Map(localProject.captions.map((c) => [c.id, c]));
+      const syncPlan = buildTimelineSyncPlan({
+        captions: localProject.captions,
+        measuredClips: existingClips.map((c) => {
+          const orig = captionById.get(c.segmentId);
+          return {
+            segmentId: c.segmentId,
+            start: orig ? orig.start : c.start,
+            end: orig ? orig.end : c.end,
+            duration: c.duration,
+            speechDuration: c.speechDuration,
+            leadingSilence: c.leadingSilence,
+            trailingSilence: c.trailingSilence,
+          };
+        }),
+        originalVideoDuration: localProject.metadata?.duration || 112,
+        syncMode: normalizedMode,
+        continuousPauseMs: pauseMs,
+      });
+
+      const clips = applySyncPlanToClips(existingClips, syncPlan);
+      const merged = await renderMergedDubWavFromClips({
+        projectId,
+        clipEntries: clips.map((c) => ({ audioUri: c.audioUrl, startSec: c.start })),
+        totalDuration: syncPlan.estimatedFinalDuration,
+      });
+
+      const updated = await updateProjectLocal(projectId, {
+        voice: {
+          ...localProject.voice,
+          syncMode: normalizedMode,
+          continuousPauseMs: pauseMs,
+          speakingSpeed: 1.0,
+          generatedClips: clips,
+          fullDubUrl: merged.fullDubUrl,
+          syncPlan,
+        },
+      });
+      return { project: updated };
+    }
+
     const res = await aiBackendRequest<{ project: Project }>(
       `/api/projects/${projectId}/dubbing/resync`,
       {
@@ -1082,9 +1276,9 @@ export const api = {
         body: JSON.stringify({
           syncMode,
           continuousPauseMs,
-          captions: localProject?.captions,
-          voice: localProject?.voice,
-          totalDuration: localProject?.metadata?.duration,
+          captions: localProject.captions,
+          voice: localProject.voice,
+          totalDuration: localProject.metadata?.duration,
         }),
       }
     );
@@ -1104,6 +1298,56 @@ export const api = {
     }
   ) => {
     const localProject = await getProjectLocal(projectId);
+    if (!localProject) throw new Error('Project not found.');
+
+    const existingClips = localProject.voice.generatedClips || [];
+    const useEdgeDub =
+      existingClips.length === 0 || existingClips.every((c) => isLocalMediaUri(c.audioUrl));
+
+    if (useEdgeDub) {
+      const captions = params.captions || localProject.captions;
+      const mergedVoice: Project['voice'] = {
+        ...localProject.voice,
+        ...(params.voice || {}),
+        provider: 'fish',
+        speakingSpeed: 1.0,
+        enabled: true,
+      };
+      const result = await generateEdgeFishDubbing({
+        project: localProject,
+        captions,
+        voiceConfig: mergedVoice,
+        useTranslated: params.useTranslated ?? true,
+        fishEndpointUrl: resolveApiUrl('/api/fish-audio'),
+        targetSegmentIds: new Set(params.segmentIds),
+      });
+      const targetSet = new Set(params.segmentIds);
+      const remainingPending = (localProject.translation.pendingRegenerateSegmentIds || []).filter(
+        (id) => !targetSet.has(id)
+      );
+      const updated = await updateProjectLocal(projectId, {
+        captions,
+        translation: {
+          ...localProject.translation,
+          pendingRegenerateSegmentIds: remainingPending,
+        },
+        voice: {
+          ...mergedVoice,
+          syncMode: result.syncPlan.syncMode,
+          continuousPauseMs:
+            result.syncPlan.pauseDurationMs ?? mergedVoice.continuousPauseMs,
+          generatedClips: result.clips,
+          fullDubUrl: result.fullDubUrl,
+          syncPlan: result.syncPlan,
+        },
+      });
+      return {
+        project: updated,
+        regeneratedIds: result.regeneratedIds,
+        fullDubUrl: result.fullDubUrl,
+      };
+    }
+
     const res = await aiBackendRequest<{
       project: Project;
       regeneratedIds: string[];
@@ -1113,13 +1357,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...params,
-        totalDuration: localProject?.metadata?.duration,
+        totalDuration: localProject.metadata?.duration,
       }),
     });
     const merged = await updateProjectLocal(projectId, {
       captions: res.project.captions,
       voice: res.project.voice,
-      translation: res.project.translation || localProject?.translation,
+      translation: res.project.translation || localProject.translation,
     });
     return {
       project: merged,
