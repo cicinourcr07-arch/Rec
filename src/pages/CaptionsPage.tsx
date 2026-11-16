@@ -43,7 +43,7 @@ import {
   StudioPresetAssetRef,
   SubtitleStyle,
 } from '../types/studio';
-import { api } from '../lib/api';
+import { api, resolveApiUrl } from '../lib/api';
 import {
   BUILTIN_FONT_CATALOG,
   ensureFontLoaded,
@@ -2378,14 +2378,14 @@ export function CaptionsPage({
         {project.captions.length > 0 && (
           <div className="flex items-center gap-2">
             <a
-              href={`/api/projects/${project.id}/subtitles/srt`}
+              href={resolveApiUrl(`/api/projects/${project.id}/subtitles/srt`)}
               className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1 cursor-pointer"
             >
               <Download className="w-3 h-3" />
               SRT
             </a>
             <a
-              href={`/api/projects/${project.id}/subtitles/vtt`}
+              href={resolveApiUrl(`/api/projects/${project.id}/subtitles/vtt`)}
               className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1 cursor-pointer"
             >
               <Download className="w-3 h-3" />

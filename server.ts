@@ -1,9 +1,8 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import fs from 'fs';
 import multer from 'multer';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { v4 as uuidv4 } from 'uuid';
 import {
   AUDIO_DIR,
@@ -118,13 +117,62 @@ import {
   SyncMode,
 } from './src/types/studio.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const app = express();
+app.set('trust proxy', 1);
 
-// Enable CORS for cross-origin frontend hosting (e.g. Cloudflare Pages *.pages.dev)
+function parseAllowedOrigins(): string[] {
+  const raw = [
+    process.env.CORS_ORIGINS,
+    process.env.FRONTEND_URL,
+    process.env.APP_URL,
+  ]
+    .filter(Boolean)
+    .join(',');
+  return raw
+    .split(',')
+    .map((s) => s.trim().replace(/\/+$/, ''))
+    .filter((s) => s && s !== 'MY_APP_URL');
+}
+
+function isOriginAllowed(origin: string | undefined, allowlist: string[]): boolean {
+  if (!origin) return true;
+  if (allowlist.length === 0 || allowlist.includes('*')) return true;
+  const normalized = origin.replace(/\/+$/, '');
+  if (allowlist.includes(normalized)) return true;
+
+  try {
+    const parsed = new URL(normalized);
+    if (
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '127.0.0.1' ||
+      parsed.hostname.endsWith('.pages.dev') ||
+      parsed.hostname.endsWith('.run.app')
+    ) {
+      return process.env.STRICT_CORS === 'true' ? allowlist.includes(normalized) : true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+// Production-ready CORS & Cross-Origin Resource Policy for Cloudflare Pages (*.pages.dev) + custom domains
 app.use((req, res, next) => {
-  const origin = req.headers.origin || '*';
-  res.header('Access-Control-Allow-Origin', origin);
+  const origin = req.headers.origin;
+  const allowlist = parseAllowedOrigins();
+  const allowed = isOriginAllowed(origin, allowlist);
+
+  res.header('Vary', 'Origin');
+  res.header('Cross-Origin-Resource-Policy', 'cross-origin');
+
+  if (origin && allowed) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+  } else if (!origin && (allowlist.length === 0 || allowlist.includes('*'))) {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
   res.header(
     'Access-Control-Allow-Headers',
@@ -134,12 +182,36 @@ app.use((req, res, next) => {
     'Access-Control-Expose-Headers',
     'Content-Length, Content-Range, Accept-Ranges, Content-Disposition'
   );
-  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400');
 
   if (req.method === 'OPTIONS') {
+    if (origin && !allowed) {
+      res.status(403).json({ error: `CORS origin not allowed: ${origin}` });
+      return;
+    }
     res.sendStatus(204);
     return;
   }
+  next();
+});
+
+// Concise server logs for uploads, exports, and API errors
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) {
+    next();
+    return;
+  }
+  const startMs = Date.now();
+  res.on('finish', () => {
+    const isPolling = req.method === 'GET' && /^\/api\/(jobs|projects)$/.test(req.path);
+    const isChunk = /\/api\/uploads\/[^/]+\/chunk$/.test(req.path);
+    if ((isPolling || isChunk) && res.statusCode < 400) {
+      return;
+    }
+    console.log(
+      `[API] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - startMs}ms)`
+    );
+  });
   next();
 });
 
@@ -154,6 +226,26 @@ app.use(
 const uploadMem = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 55 * 1024 * 1024 },
+});
+
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'recap-studio-backend',
+    storageDir: STORAGE_DIR,
+    uptimeSec: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'recap-studio-backend',
+    storageDir: STORAGE_DIR,
+    uptimeSec: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // Media streaming route with HTTP Range & HEAD support for video seeking and download disposition
@@ -249,7 +341,14 @@ app.get('/media/:bucket/:filename', (req, res) => {
       'Content-Length': chunkSize,
       'Content-Type': contentType,
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.on('error', (err) => {
+      console.error('[Media Stream Error]', err);
+      if (!res.headersSent) res.sendStatus(500);
+      else res.end();
+    });
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
     return;
   }
 
@@ -258,7 +357,14 @@ app.get('/media/:bucket/:filename', (req, res) => {
     'Content-Type': contentType,
     'Accept-Ranges': 'bytes',
   });
-  fs.createReadStream(filePath).pipe(res);
+  const fullStream = fs.createReadStream(filePath);
+  fullStream.on('error', (err) => {
+    console.error('[Media Stream Error]', err);
+    if (!res.headersSent) res.sendStatus(500);
+    else res.end();
+  });
+  res.on('close', () => fullStream.destroy());
+  fullStream.pipe(res);
 });
 
 // System Diagnostics & Configuration Status
@@ -1943,20 +2049,54 @@ app.get('/api/jobs', (_req, res) => {
   res.json({ jobs: listAllJobs() });
 });
 
+// Express JSON error handler for Multer size limits and unexpected server errors
+app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+  console.error(`[API Error] ${req.method} ${req.originalUrl}:`, err);
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({
+        error: `Uploaded file exceeds the 55 MB direct multipart limit. Use the chunked upload flow (/api/uploads/init) for videos up to ${Math.round(
+          getMaxUploadBytes() / (1024 * 1024)
+        )} MB.`,
+      });
+      return;
+    }
+    res.status(400).json({ error: err.message });
+    return;
+  }
+  const message = err instanceof Error ? err.message : 'Internal server error';
+  res.status(500).json({ error: message });
+});
+
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
+  const distPath = path.resolve('./dist');
+  const distIndexPath = path.join(distPath, 'index.html');
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve('./dist');
+  } else if (fs.existsSync(distIndexPath)) {
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(distIndexPath);
+    });
+  } else {
+    app.get('/', (_req, res) => {
+      res.json({
+        ok: true,
+        service: 'recap-studio-backend',
+        mode: 'api-only',
+        health: '/health',
+        systemStatus: '/api/system/status',
+      });
+    });
+    app.use('/api/*', (_req, res) => {
+      res.status(404).json({ error: 'API endpoint not found.' });
     });
   }
 
@@ -1966,7 +2106,13 @@ async function startServer() {
   }, 6 * 3600 * 1000);
 
   app.listen(PORT, '0.0.0.0', () => {
+    const allowedOrigins = parseAllowedOrigins();
     console.log(`Recap Studio AI server listening on http://0.0.0.0:${PORT}`);
+    console.log(
+      `[Config] mode=${isProd ? 'production' : 'development'} storageDir=${STORAGE_DIR} corsOrigins=${
+        allowedOrigins.length > 0 ? allowedOrigins.join(',') : 'auto(*.pages.dev,localhost)'
+      }`
+    );
   });
 }
 

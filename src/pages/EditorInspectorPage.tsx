@@ -46,7 +46,7 @@ import {
   VisualEffectType,
   VoiceConfig,
 } from '../types/studio';
-import { api, uploadVideoChunked } from '../lib/api';
+import { api, resolveApiUrl, uploadVideoChunked } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { createWorkflowUpdate, resolveCanvasDimensions } from '../lib/workflowStages';
 import { LayerPanel } from '../components/LayerPanel';
@@ -2284,9 +2284,9 @@ export function EditorInspectorPage({
 
             {extractedAudio && (
               <div className="space-y-2 pt-1">
-                <audio src={extractedAudio.audioUrl} controls className="w-full h-8" />
+                <audio src={resolveApiUrl(extractedAudio.audioUrl)} controls className="w-full h-8" />
                 <a
-                  href={extractedAudio.downloadUrl}
+                  href={resolveApiUrl(extractedAudio.downloadUrl)}
                   className="inline-flex items-center gap-1.5 text-[11px] text-violet-400 hover:text-violet-300"
                 >
                   <Download className="w-3 h-3" />

@@ -1,3 +1,5 @@
+import { resolveApiUrl } from './api';
+
 export type FontCategoryId =
   | 'Modern'
   | 'Bold & Viral'
@@ -177,7 +179,9 @@ export async function ensureFontLoaded(params: {
       if (!fontUrl) {
         // Ask server to resolve & cache real TTF file for both browser + FFmpeg libass
         const resp = await fetch(
-          `/api/fonts/ensure?family=${encodeURIComponent(cleanFamily)}&weight=${resolvedWeight}&italic=${italic ? '1' : '0'}`
+          resolveApiUrl(
+            `/api/fonts/ensure?family=${encodeURIComponent(cleanFamily)}&weight=${resolvedWeight}&italic=${italic ? '1' : '0'}`
+          )
         );
         const data = (await resp.json()) as {
           available?: boolean;
@@ -198,9 +202,10 @@ export async function ensureFontLoaded(params: {
           notifyFontListeners();
           return entry;
         }
-        fontUrl = data.url;
+        fontUrl = resolveApiUrl(data.url);
         source = data.source || 'builtin';
       } else {
+        fontUrl = resolveApiUrl(fontUrl);
         // Verify custom URL is reachable & non-empty
         const head = await fetch(fontUrl, { method: 'HEAD' });
         if (!head.ok) {

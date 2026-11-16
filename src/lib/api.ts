@@ -30,12 +30,14 @@ export interface LocalAssetManifestItem {
   necessaryForCloudSync: boolean;
 }
 
-export const API_BASE_URL = (
+export const API_BASE_URL = String(
   (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL) ||
-  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_BACKEND_URL) ||
-  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_APP_URL) ||
-  ''
-).replace(/\/+$/, '');
+    (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_BACKEND_URL) ||
+    (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_APP_URL) ||
+    ''
+)
+  .trim()
+  .replace(/\/+$/, '');
 
 export function resolveApiUrl(path: string): string {
   if (!path) return '';
@@ -53,7 +55,16 @@ export function resolveApiUrl(path: string): string {
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const fullUrl = resolveApiUrl(url);
-  const res = await fetch(fullUrl, init);
+  let res: Response;
+  try {
+    res = await fetch(fullUrl, init);
+  } catch (err) {
+    const target = API_BASE_URL || 'current origin';
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Network error reaching backend (${target}): ${detail}. Ensure the Express server is running and CORS allows this frontend origin.`
+    );
+  }
   const raw = await res.text();
   let data: Record<string, unknown> | null = null;
   if (raw) {
@@ -327,7 +338,7 @@ export const api = {
       }
     ),
 
-  exportPresetsUrl: '/api/presets/export',
+  exportPresetsUrl: resolveApiUrl('/api/presets/export'),
 
   listProjects: () => request<{ projects: Project[] }>('/api/projects'),
 

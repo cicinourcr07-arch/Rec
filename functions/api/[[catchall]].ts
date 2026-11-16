@@ -68,6 +68,7 @@ export const onRequest = async (context: {
   // Forward the request (including streaming video upload chunks and multipart data) to Express
   const targetUrl = `${backendBase}${url.pathname}${url.search}`;
   const forwardHeaders = new Headers(request.headers);
+  forwardHeaders.delete('host');
   forwardHeaders.set('x-forwarded-host', url.host);
   forwardHeaders.set('x-forwarded-proto', url.protocol.replace(':', ''));
 
@@ -80,6 +81,7 @@ export const onRequest = async (context: {
     });
 
     const responseHeaders = new Headers(upstreamResponse.headers);
+    responseHeaders.set('Vary', 'Origin');
     responseHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '*');
     responseHeaders.set(
       'Access-Control-Allow-Methods',

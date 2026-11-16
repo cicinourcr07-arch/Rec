@@ -40,7 +40,9 @@ export const onRequest = async (context: {
 
   const targetUrl = `${backendBase}${url.pathname}${url.search}`;
   const forwardHeaders = new Headers(request.headers);
+  forwardHeaders.delete('host');
   forwardHeaders.set('x-forwarded-host', url.host);
+  forwardHeaders.set('x-forwarded-proto', url.protocol.replace(':', ''));
 
   try {
     const upstream = await fetch(targetUrl, {
@@ -50,7 +52,9 @@ export const onRequest = async (context: {
     });
 
     const headers = new Headers(upstream.headers);
-    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Vary', 'Origin');
+    headers.set('Cross-Origin-Resource-Policy', 'cross-origin');
+    headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '*');
     headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition');
 
     return new Response(upstream.body, {

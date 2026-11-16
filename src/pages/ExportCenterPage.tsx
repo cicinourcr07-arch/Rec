@@ -24,7 +24,7 @@ import {
   RenderJob,
   SavedFontAsset,
 } from '../types/studio';
-import { api } from '../lib/api';
+import { api, resolveApiUrl } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import {
   downloadProjectAsset,
@@ -106,10 +106,11 @@ export function ExportCenterPage({
       setExportValidationMsg(null);
       setVideoMetaInfo(null);
       try {
-        const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+        const resolvedUrl = resolveApiUrl(url);
+        const res = await fetch(resolvedUrl, { method: 'HEAD', cache: 'no-store' });
         const size = Number(res.headers.get('content-length') || 0);
         if (res.ok && size >= 1024) {
-          setResolvedExportUrl(`${url}?v=${encodeURIComponent(project.lastExportedAt || '1')}`);
+          setResolvedExportUrl(`${resolvedUrl}?v=${encodeURIComponent(project.lastExportedAt || '1')}`);
           setExportValidation('valid');
           return;
         }
@@ -904,6 +905,7 @@ export function ExportCenterPage({
                         ref={finalVideoRef}
                         key={`${resolvedExportUrl}_${project.lastExportedAt || ''}`}
                         src={resolvedExportUrl}
+                        crossOrigin="anonymous"
                         controls
                         playsInline
                         preload="metadata"
@@ -976,7 +978,7 @@ export function ExportCenterPage({
                       <span className="text-zinc-400">{Math.round(j.progress)}%</span>
                       {j.outputUrl && (
                         <a
-                          href={`${j.outputUrl}?download=1`}
+                          href={resolveApiUrl(`${j.outputUrl}?download=1`)}
                           className="text-violet-400 hover:text-violet-300 font-medium"
                         >
                           Download MP4

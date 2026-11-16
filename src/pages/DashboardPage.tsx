@@ -18,7 +18,7 @@ import {
   UploadCloud,
 } from 'lucide-react';
 import { NavPage, Project, RenderJob, StudioPreset } from '../types/studio';
-import { api, PresetWarning, uploadVideoChunked } from '../lib/api';
+import { api, PresetWarning, resolveApiUrl, uploadVideoChunked } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { indexedDbStore } from '../lib/indexedDbStore';
 import { importProjectBackupZip } from '../lib/projectBackup';
@@ -595,7 +595,7 @@ export function DashboardPage({
                   <div className="aspect-video bg-[#070709] relative overflow-hidden border-b border-white/[0.06] flex items-center justify-center">
                     {p.thumbnailUrl ? (
                       <img
-                        src={p.thumbnailUrl}
+                        src={resolveApiUrl(p.thumbnailUrl)}
                         alt={p.name}
                         className="w-full h-full object-cover"
                       />

@@ -32,7 +32,7 @@ import {
   SupportedLanguage,
   VoiceConfig,
 } from '../types/studio';
-import { api } from '../lib/api';
+import { api, resolveApiUrl } from '../lib/api';
 import { formatBytes, formatTimecode } from '../lib/formatters';
 import { createWorkflowUpdate } from '../lib/workflowStages';
 import { VideoStudioPlayer } from '../components/VideoStudioPlayer';
@@ -610,7 +610,7 @@ export function VoiceStudioPage({
                     <span>Voice Sample Preview (MP3)</span>
                     <span className="font-mono text-[11px] text-violet-300">s2.1-pro-free</span>
                   </div>
-                  <audio src={previewAudioUrl} controls autoPlay className="w-full h-9" />
+                  <audio src={resolveApiUrl(previewAudioUrl)} controls autoPlay className="w-full h-9" />
                 </div>
               )}
 
@@ -621,13 +621,13 @@ export function VoiceStudioPage({
                       Synchronized Full Dub Track ({voice.generatedClips.length} segments)
                     </span>
                     <a
-                      href={`${voice.fullDubUrl}?download=1`}
+                      href={resolveApiUrl(`${voice.fullDubUrl}?download=1`)}
                       className="text-[11px] font-mono text-violet-300 hover:text-violet-200"
                     >
                       Download MP3
                     </a>
                   </div>
-                  <audio src={voice.fullDubUrl} controls className="w-full h-9" />
+                  <audio src={resolveApiUrl(voice.fullDubUrl)} controls className="w-full h-9" />
                 </div>
               )}
             </div>

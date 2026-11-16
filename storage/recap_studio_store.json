@@ -67,6 +67,50 @@
       "mime_type": "image/jpeg",
       "size_bytes": 2025,
       "created_at": "2026-11-16T18:25:55.196Z"
+    },
+    {
+      "id": "d1e8694c-fe19-428f-b16a-f9446e479280",
+      "project_id": "0d6ba493-464b-4b39-ba52-c0e4cbb36d5f",
+      "kind": "video",
+      "filename": "e2e_test.mp4",
+      "file_path": "/app/applet/storage/uploads/0d6ba493_1794855800828_e2e_test.mp4",
+      "url": "/media/uploads/0d6ba493_1794855800828_e2e_test.mp4",
+      "mime_type": "video/mp4",
+      "size_bytes": 32366,
+      "created_at": "2026-11-16T19:03:20.831Z"
+    },
+    {
+      "id": "876c7af0-fb58-42b4-9bca-efe1a22a751b",
+      "project_id": "0d6ba493-464b-4b39-ba52-c0e4cbb36d5f",
+      "kind": "thumb",
+      "filename": "0d6ba493-464b-4b39-ba52-c0e4cbb36d5f_thumb_1794855800908.jpg",
+      "file_path": "/app/applet/storage/thumbs/0d6ba493-464b-4b39-ba52-c0e4cbb36d5f_thumb_1794855800908.jpg",
+      "url": "/media/thumbs/0d6ba493-464b-4b39-ba52-c0e4cbb36d5f_thumb_1794855800908.jpg",
+      "mime_type": "image/jpeg",
+      "size_bytes": 21809,
+      "created_at": "2026-11-16T19:03:20.991Z"
+    },
+    {
+      "id": "f6def6ba-aeb7-41cf-ac54-1d40f28e89f7",
+      "project_id": "0d6ba493-464b-4b39-ba52-c0e4cbb36d5f",
+      "kind": "video",
+      "filename": "direct_test.mp4",
+      "file_path": "/app/applet/storage/uploads/0d6ba493_1794855801093_direct_test.mp4",
+      "url": "/media/uploads/0d6ba493_1794855801093_direct_test.mp4",
+      "mime_type": "video/mp4",
+      "size_bytes": 32366,
+      "created_at": "2026-11-16T19:03:21.094Z"
+    },
+    {
+      "id": "24f1698b-fca0-4271-be05-c72a95d0d090",
+      "project_id": "0d6ba493-464b-4b39-ba52-c0e4cbb36d5f",
+      "kind": "thumb",
+      "filename": "0d6ba493-464b-4b39-ba52-c0e4cbb36d5f_thumb_1794855801168.jpg",
+      "file_path": "/app/applet/storage/thumbs/0d6ba493-464b-4b39-ba52-c0e4cbb36d5f_thumb_1794855801168.jpg",
+      "url": "/media/thumbs/0d6ba493-464b-4b39-ba52-c0e4cbb36d5f_thumb_1794855801168.jpg",
+      "mime_type": "image/jpeg",
+      "size_bytes": 21809,
+      "created_at": "2026-11-16T19:03:21.253Z"
     }
   ],
   "appSettings": {},

@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: recap-studio-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: recap-studio-storage
+      mountPath: /var/data/recap-studio
+      sizeGB: 10
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: STORAGE_DIR
+        value: /var/data/recap-studio
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "2048"
+      - key: TEMP_RETENTION_HOURS
+        value: "24"
+      - key: FRONTEND_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FISH_API_KEY
+        sync: false
+      - key: FISH_API_BASE_URL
+        value: https://api.fish.audio

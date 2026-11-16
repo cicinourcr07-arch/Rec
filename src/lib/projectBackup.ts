@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { Project } from '../types/studio';
-import { api, LocalAssetManifestItem } from './api';
+import { api, LocalAssetManifestItem, resolveApiUrl } from './api';
 import { indexedDbStore } from './indexedDbStore';
 
 interface BackupManifestFile {
@@ -39,7 +39,7 @@ export async function exportProjectBackupZip(
 
     let blob: Blob | null = null;
     try {
-      const resp = await fetch(asset.localUrl);
+      const resp = await fetch(resolveApiUrl(asset.localUrl));
       if (resp.ok) {
         blob = await resp.blob();
       }

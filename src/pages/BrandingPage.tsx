@@ -11,7 +11,7 @@ import {
   UploadCloud,
 } from 'lucide-react';
 import { LogoMotionConfig, LogoMotionPattern, LogoOverlay, Project } from '../types/studio';
-import { api } from '../lib/api';
+import { api, resolveApiUrl } from '../lib/api';
 
 interface BrandingPageProps {
   project: Project;
@@ -166,7 +166,7 @@ export function BrandingPage({
             >
               <div className="flex items-center gap-2 truncate">
                 <img
-                  src={logo.url}
+                  src={resolveApiUrl(logo.url)}
                   alt={logo.filename}
                   className="w-6 h-6 object-contain bg-zinc-900 rounded p-0.5 shrink-0"
                 />

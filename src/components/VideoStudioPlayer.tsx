@@ -43,6 +43,7 @@ import {
   resolveClosestSupportedWeight,
   subscribeFontStatus,
 } from '../lib/fontCatalog';
+import { resolveApiUrl } from '../lib/api';
 import { resolvePlayableAssetUrl } from '../lib/supabaseCloud';
 import { buildOrderedLayerTokens } from './LayerPanel';
 
@@ -471,19 +472,23 @@ export function VideoStudioPlayer({
     music: string | null;
     sfx: string | null;
   }>({
-    video: project.sourceVideoUrl,
-    dub: project.voice.fullDubUrl || null,
-    music: project.voice.bgMusicUrl || null,
-    sfx: project.voice.sfxUrl || null,
+    video: project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : null,
+    dub: project.voice.fullDubUrl ? resolveApiUrl(project.voice.fullDubUrl) : null,
+    music: project.voice.bgMusicUrl ? resolveApiUrl(project.voice.bgMusicUrl) : null,
+    sfx: project.voice.sfxUrl ? resolveApiUrl(project.voice.sfxUrl) : null,
   });
 
   useEffect(() => {
     let active = true;
+    const fallbackVideo = project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : null;
+    const fallbackDub = project.voice.fullDubUrl ? resolveApiUrl(project.voice.fullDubUrl) : null;
+    const fallbackMusic = project.voice.bgMusicUrl ? resolveApiUrl(project.voice.bgMusicUrl) : null;
+    const fallbackSfx = project.voice.sfxUrl ? resolveApiUrl(project.voice.sfxUrl) : null;
     setResolvedUrls({
-      video: project.sourceVideoUrl,
-      dub: project.voice.fullDubUrl || null,
-      music: project.voice.bgMusicUrl || null,
-      sfx: project.voice.sfxUrl || null,
+      video: fallbackVideo,
+      dub: fallbackDub,
+      music: fallbackMusic,
+      sfx: fallbackSfx,
     });
     void Promise.all([
       resolvePlayableAssetUrl(project.sourceVideoUrl, project.cloudAssets),
@@ -493,10 +498,10 @@ export function VideoStudioPlayer({
     ]).then(([video, dub, music, sfx]) => {
       if (!active) return;
       setResolvedUrls({
-        video: video || project.sourceVideoUrl,
-        dub: dub || project.voice.fullDubUrl || null,
-        music: music || project.voice.bgMusicUrl || null,
-        sfx: sfx || project.voice.sfxUrl || null,
+        video: video || fallbackVideo,
+        dub: dub || fallbackDub,
+        music: music || fallbackMusic,
+        sfx: sfx || fallbackSfx,
       });
     });
     return () => {
@@ -1991,7 +1996,7 @@ export function VideoStudioPlayer({
                   } ${onUpdateCanvas && !canvas.bgImageLocked ? 'cursor-move' : ''}`}
                 >
                   <img
-                    src={canvas.bgImageUrl}
+                    src={resolveApiUrl(canvas.bgImageUrl)}
                     alt="Canvas background"
                     draggable={false}
                     className="w-full h-full object-cover pointer-events-none select-none"
@@ -2002,7 +2007,8 @@ export function VideoStudioPlayer({
             {canvas.backgroundType === 'blur' && canvas.bgImageVisible !== false && (
               <video
                 ref={bgVideoRef}
-                src={resolvedUrls.video || project.sourceVideoUrl}
+                src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
+                crossOrigin="anonymous"
                 muted
                 playsInline
                 aria-hidden="true"
@@ -2055,7 +2061,8 @@ export function VideoStudioPlayer({
                 <div className="w-full h-full overflow-hidden relative">
                   <video
                     ref={videoRef}
-                    src={resolvedUrls.video || project.sourceVideoUrl}
+                    src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
+                    crossOrigin="anonymous"
                     playsInline
                     style={stageMetrics.fgVideoStyle}
                     onLoadedMetadata={(e) => {
@@ -2121,7 +2128,8 @@ export function VideoStudioPlayer({
             ) : (
               <video
                 ref={videoRef}
-                src={resolvedUrls.video || project.sourceVideoUrl}
+                src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
+                crossOrigin="anonymous"
                 playsInline
                 style={{
                   filter: videoFilterCss,
@@ -2178,7 +2186,8 @@ export function VideoStudioPlayer({
                 >
                   {/* Dimmed full original video preview */}
                   <video
-                    src={resolvedUrls.video || project.sourceVideoUrl}
+                    src={resolvedUrls.video || (project.sourceVideoUrl ? resolveApiUrl(project.sourceVideoUrl) : undefined)}
+                    crossOrigin="anonymous"
                     muted
                     playsInline
                     ref={(el) => {
@@ -2369,7 +2378,7 @@ export function VideoStudioPlayer({
             {project.voice.fullDubUrl && (
               <audio
                 ref={dubAudioRef}
-                src={resolvedUrls.dub || project.voice.fullDubUrl}
+                src={resolvedUrls.dub || resolveApiUrl(project.voice.fullDubUrl)}
                 preload="auto"
                 crossOrigin="anonymous"
               />
@@ -2377,7 +2386,7 @@ export function VideoStudioPlayer({
             {project.voice.bgMusicUrl && (
               <audio
                 ref={musicAudioRef}
-                src={resolvedUrls.music || project.voice.bgMusicUrl}
+                src={resolvedUrls.music || resolveApiUrl(project.voice.bgMusicUrl)}
                 loop
                 preload="auto"
                 crossOrigin="anonymous"
@@ -2386,7 +2395,7 @@ export function VideoStudioPlayer({
             {project.voice.sfxUrl && (
               <audio
                 ref={sfxAudioRef}
-                src={resolvedUrls.sfx || project.voice.sfxUrl}
+                src={resolvedUrls.sfx || resolveApiUrl(project.voice.sfxUrl)}
                 preload="auto"
                 crossOrigin="anonymous"
               />
@@ -2574,8 +2583,9 @@ export function VideoStudioPlayer({
                   }}
                 >
                   <img
-                    src={logo.url}
+                    src={resolveApiUrl(logo.url)}
                     alt={logo.filename}
+                    crossOrigin="anonymous"
                     draggable={false}
                     className="w-full h-auto pointer-events-none select-none"
                   />

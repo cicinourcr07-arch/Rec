@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { Project, SavedFontAsset } from '../types/studio';
-import { api } from '../lib/api';
+import { api, resolveApiUrl } from '../lib/api';
 import { downloadProjectAsset } from '../lib/supabaseCloud';
 import {
   BUILTIN_FONT_CATALOG,
@@ -314,10 +314,11 @@ async function drawThumbnailToCanvas(
   // Load source frame image cleanly
   const img = new Image();
   img.crossOrigin = 'anonymous';
+  const resolvedImageUrl = resolveApiUrl(design.imageUrl);
   await new Promise<void>((resolve, reject) => {
     img.onload = () => resolve();
-    img.onerror = () => reject(new Error(`Failed to load thumbnail frame: ${design.imageUrl}`));
-    img.src = design.imageUrl;
+    img.onerror = () => reject(new Error(`Failed to load thumbnail frame: ${resolvedImageUrl}`));
+    img.src = resolvedImageUrl;
   });
   if (typeof img.decode === 'function') {
     await img.decode().catch(() => {});
@@ -829,7 +830,7 @@ export function TikTokThumbnailEditor({
                 >
                   <div className="relative aspect-[9/16] max-h-36 bg-black overflow-hidden">
                     <img
-                      src={d.imageUrl}
+                      src={resolveApiUrl(d.imageUrl)}
                       alt={`Thumbnail frame ${idx + 1}`}
                       className="w-full h-full object-cover"
                     />
@@ -1353,7 +1354,7 @@ export function TikTokThumbnailEditor({
               >
                 <div className="aspect-[9/16] max-h-32 bg-black overflow-hidden">
                   <img
-                    src={st.url}
+                    src={resolveApiUrl(st.url)}
                     alt={st.label}
                     className="w-full h-full object-cover"
                   />
