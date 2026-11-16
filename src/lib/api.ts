@@ -915,9 +915,30 @@ export const api = {
     jobs: await listProjectJobsLocal(projectId),
   }),
   getJob: async (jobId: string) => {
-    const job = await getJobLocal(jobId);
-    if (!job) throw new Error('Render job not found.');
-    return { job };
+    const localJob = await getJobLocal(jobId);
+    if (localJob && (localJob.status === 'completed' || localJob.status === 'failed' || localJob.type !== 'voice')) {
+      return { job: localJob };
+    }
+    const res = await aiBackendRequest<{
+      job: RenderJob;
+      dubResult?: { captions: Project['captions']; voicePatch: Partial<Project['voice']> };
+    }>(`/api/jobs/${jobId}`);
+    if (res.job.status === 'completed' || res.job.status === 'failed') {
+      if (res.dubResult) {
+        const localProject = await getProjectLocal(res.job.projectId);
+        if (localProject) {
+          await updateProjectLocal(res.job.projectId, {
+            captions: res.dubResult.captions,
+            voice: {
+              ...localProject.voice,
+              ...res.dubResult.voicePatch,
+            },
+          });
+        }
+      }
+      await upsertJobLocal(res.job);
+    }
+    return { job: res.job };
   },
   listAllJobs: async () => ({ jobs: await listAllJobsLocal() }),
 
@@ -968,15 +989,63 @@ export const api = {
       }
     ),
 
-  transcribeWithFish: (projectId: string, sourceLanguage?: string) =>
-    aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
-      `/api/projects/${projectId}/dubbing/transcribe`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceLanguage }),
+  transcribeWithFish: async (projectId: string, sourceLanguage?: string) => {
+    const localProject = await getProjectLocal(projectId);
+    if (!localProject || !localProject.sourceVideoUrl) {
+      throw new Error('Select a video before running Fish Audio transcription.');
+    }
+
+    let res: { project: Project; detectedLanguage: string; segmentCount: number };
+    if (isLocalMediaUri(localProject.sourceVideoUrl)) {
+      const videoBlob = await getMediaBlob(localProject.sourceVideoUrl);
+      if (!videoBlob) {
+        throw new Error('Video file is unavailable in browser storage. Please re-select the video.');
       }
-    ),
+      const extracted = await extractBrowserAudioTrack({
+        sourceUri: localProject.sourceVideoUrl,
+        sourceFilename: localProject.sourceFilename || 'video.mp4',
+      });
+      const wavBlob = await getMediaBlob(extracted.audioUrl);
+      if (!wavBlob) {
+        throw new Error('Failed to read extracted browser audio track for transcription.');
+      }
+      const formData = new FormData();
+      formData.append('audio', wavBlob, extracted.filename || 'audio.wav');
+      formData.append('duration', String(localProject.metadata?.duration || 10));
+      if (sourceLanguage) {
+        formData.append('sourceLanguage', sourceLanguage);
+      }
+      res = await aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
+        `/api/projects/${projectId}/dubbing/transcribe`,
+        {
+          method: 'POST',
+          body: formData,
+        }
+      );
+    } else {
+      res = await aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
+        `/api/projects/${projectId}/dubbing/transcribe`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sourceLanguage }),
+        }
+      );
+    }
+
+    const merged = await updateProjectLocal(projectId, {
+      captions: res.project.captions,
+      translation: {
+        ...localProject.translation,
+        sourceLanguage: res.detectedLanguage,
+      },
+    });
+    return {
+      project: merged,
+      detectedLanguage: res.detectedLanguage,
+      segmentCount: res.segmentCount,
+    };
+  },
 
   previewFishDub: (
     projectId: string,
@@ -988,24 +1057,44 @@ export const api = {
       body: JSON.stringify(params),
     }),
 
-  generateFishDub: (
+  generateFishDub: async (
     projectId: string,
     params: { voice: Project['voice']; captions?: Project['captions']; useTranslated?: boolean }
-  ) =>
-    aiBackendRequest<{ job: RenderJob }>(`/api/projects/${projectId}/dubbing/generate`, {
+  ) => {
+    const localProject = await getProjectLocal(projectId);
+    return aiBackendRequest<{ job: RenderJob }>(`/api/projects/${projectId}/dubbing/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
+      body: JSON.stringify({
+        ...params,
+        totalDuration: localProject?.metadata?.duration,
+      }),
+    });
+  },
 
-  resyncFishDub: (projectId: string, syncMode: SyncMode, continuousPauseMs?: number) =>
-    aiBackendRequest<{ project: Project }>(`/api/projects/${projectId}/dubbing/resync`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ syncMode, continuousPauseMs }),
-    }),
+  resyncFishDub: async (projectId: string, syncMode: SyncMode, continuousPauseMs?: number) => {
+    const localProject = await getProjectLocal(projectId);
+    const res = await aiBackendRequest<{ project: Project }>(
+      `/api/projects/${projectId}/dubbing/resync`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          syncMode,
+          continuousPauseMs,
+          captions: localProject?.captions,
+          voice: localProject?.voice,
+          totalDuration: localProject?.metadata?.duration,
+        }),
+      }
+    );
+    const merged = await updateProjectLocal(projectId, {
+      voice: res.project.voice,
+    });
+    return { project: merged };
+  },
 
-  regenerateFishSegments: (
+  regenerateFishSegments: async (
     projectId: string,
     params: {
       segmentIds: string[];
@@ -1013,16 +1102,31 @@ export const api = {
       voice?: Partial<Project['voice']>;
       useTranslated?: boolean;
     }
-  ) =>
-    aiBackendRequest<{
+  ) => {
+    const localProject = await getProjectLocal(projectId);
+    const res = await aiBackendRequest<{
       project: Project;
       regeneratedIds: string[];
       fullDubUrl: string;
     }>(`/api/projects/${projectId}/dubbing/regenerate-segments`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    }),
+      body: JSON.stringify({
+        ...params,
+        totalDuration: localProject?.metadata?.duration,
+      }),
+    });
+    const merged = await updateProjectLocal(projectId, {
+      captions: res.project.captions,
+      voice: res.project.voice,
+      translation: res.project.translation || localProject?.translation,
+    });
+    return {
+      project: merged,
+      regeneratedIds: res.regeneratedIds,
+      fullDubUrl: res.fullDubUrl,
+    };
+  },
 
   previewVoice: (
     projectId: string,

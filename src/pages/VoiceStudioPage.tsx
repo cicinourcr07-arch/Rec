@@ -565,10 +565,11 @@ export function VoiceStudioPage({
         <div className="p-3.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 flex items-start gap-2.5">
           <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
           <div>
-            <span className="font-semibold">FISH_API_KEY is not configured on the server.</span> Add{' '}
-            <code className="font-mono text-amber-100">FISH_API_KEY</code> in the Secrets panel to
-            run Fish Audio ASR transcription and <code className="font-mono">s2.1-pro-free</code>{' '}
-            MP3 dubbing.
+            <span className="font-semibold">FISH_AUDIO_API_KEY is not configured on the server.</span> Add{' '}
+            <code className="font-mono text-amber-100">FISH_AUDIO_API_KEY</code> to your local{' '}
+            <code className="font-mono text-amber-100">.env</code> file or hosting environment
+            variables to run Fish Audio ASR transcription and{' '}
+            <code className="font-mono">s2.1-pro-free</code> MP3 dubbing.
           </div>
         </div>
       )}

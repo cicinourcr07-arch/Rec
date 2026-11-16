@@ -60,20 +60,34 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const PLACEHOLDER_KEYS = new Set([
+  'your_key_here',
+  'my_fish_api_key',
+  'my_fish_audio_api_key',
+]);
+
+function readFishAudioEnvKey(): string {
+  const raw = (process.env.FISH_AUDIO_API_KEY || process.env.FISH_API_KEY || '').trim();
+  if (!raw || PLACEHOLDER_KEYS.has(raw.toLowerCase())) {
+    return '';
+  }
+  return raw;
+}
+
 export function isFishAudioConfigured(): boolean {
-  const key = process.env.FISH_API_KEY;
-  return Boolean(key && key.trim().length > 0 && key !== 'MY_FISH_API_KEY');
+  return readFishAudioEnvKey().length > 0;
 }
 
 function getFishApiKey(): string {
-  if (!isFishAudioConfigured()) {
+  const key = readFishAudioEnvKey();
+  if (!key) {
     const err = new Error(
-      'FISH_API_KEY is not configured on the server. Add FISH_API_KEY in the Secrets panel to enable Fish Audio ASR transcription and s2.1-pro-free TTS dubbing.'
+      'FISH_AUDIO_API_KEY is not configured on the backend. Add FISH_AUDIO_API_KEY=your_key_here to your local .env file or hosting environment variables.'
     );
     (err as Error & { statusCode?: number }).statusCode = 503;
     throw err;
   }
-  return process.env.FISH_API_KEY!.trim();
+  return key;
 }
 
 async function fetchFishWithTimeout(
@@ -232,7 +246,9 @@ export async function listFishVoices(params: {
 }
 
 export async function transcribeVideoWithFishAudio(params: {
-  videoPath: string;
+  videoPath?: string;
+  audioBuffer?: Buffer;
+  audioFilename?: string;
   projectId: string;
   duration: number;
   hasAudio: boolean;
@@ -243,14 +259,26 @@ export async function transcribeVideoWithFishAudio(params: {
   }
 
   const apiKey = getFishApiKey();
+  const tempInput = params.audioBuffer
+    ? path.join(TEMP_DIR, `fish_asr_in_${params.projectId}_${Date.now()}_${path.basename(params.audioFilename || 'audio.wav')}`)
+    : null;
   const tempAudio = path.join(TEMP_DIR, `fish_asr_${params.projectId}_${Date.now()}.mp3`);
 
   try {
-    // Extract compact 16kHz mono 32kbps MP3 so long videos upload fast
+    let mediaInputPath = params.videoPath;
+    if (params.audioBuffer && tempInput) {
+      fs.writeFileSync(tempInput, params.audioBuffer);
+      mediaInputPath = tempInput;
+    }
+    if (!mediaInputPath) {
+      throw new Error('No video path or extracted audio buffer provided for transcription.');
+    }
+
+    // Extract compact 16kHz mono 32kbps MP3 so long clips upload fast to Fish Audio ASR
     await execFileAsync('ffmpeg', [
       '-y',
       '-i',
-      params.videoPath,
+      mediaInputPath,
       '-vn',
       '-ac',
       '1',
@@ -378,8 +406,19 @@ export async function transcribeVideoWithFishAudio(params: {
       detectedLanguage,
     };
   } finally {
+    if (tempInput && fs.existsSync(tempInput)) {
+      try {
+        fs.unlinkSync(tempInput);
+      } catch {
+        // ignore cleanup error
+      }
+    }
     if (fs.existsSync(tempAudio)) {
-      fs.unlinkSync(tempAudio);
+      try {
+        fs.unlinkSync(tempAudio);
+      } catch {
+        // ignore cleanup error
+      }
     }
   }
 }
@@ -393,15 +432,16 @@ function mapIsoToLanguageName(code?: string): string | null {
   return code;
 }
 
-async function synthesizeFishMp3Buffer(params: {
+export async function synthesizeFishMp3Buffer(params: {
   text: string;
   referenceId?: string;
+  format?: 'mp3' | 'wav' | 'pcm' | 'opus';
   maxAttempts?: number;
 }): Promise<Buffer> {
   const apiKey = getFishApiKey();
   const body: Record<string, unknown> = {
     text: params.text,
-    format: 'mp3',
+    format: params.format || 'mp3',
     normalize: true,
     latency: 'balanced',
     chunk_length: 250,
@@ -433,7 +473,7 @@ async function synthesizeFishMp3Buffer(params: {
   const arrayBuf = await res.arrayBuffer();
   const buffer = Buffer.from(arrayBuf);
   if (buffer.length < 128) {
-    const emptyErr = new Error('Fish Audio TTS returned an empty MP3 audio stream.') as Error & {
+    const emptyErr = new Error('Fish Audio TTS returned an empty audio stream.') as Error & {
       statusCode?: number;
     };
     emptyErr.statusCode = 502;
@@ -1075,12 +1115,24 @@ export async function resyncExistingFishClips(params: {
   return { clips, fullDubUrl, syncPlan };
 }
 
+export interface FishDubJobResult {
+  captions: CaptionSegment[];
+  voicePatch: Partial<VoiceConfig>;
+}
+
+const dubJobResults = new Map<string, FishDubJobResult>();
+
+export function getFishDubJobResult(jobId: string): FishDubJobResult | null {
+  return dubJobResults.get(jobId) || null;
+}
+
 const dubQueue: Array<{
   jobId: string;
   projectId: string;
   voiceConfig: VoiceConfig;
   captions: CaptionSegment[];
   useTranslated: boolean;
+  totalDuration: number;
 }> = [];
 let dubWorkerRunning = false;
 
@@ -1089,12 +1141,16 @@ export function enqueueFishDubJob(params: {
   voiceConfig: VoiceConfig;
   captions: CaptionSegment[];
   useTranslated: boolean;
+  totalDuration?: number;
 }): RenderJob {
   getFishApiKey();
   const project = getProject(params.projectId);
-  if (!project || !project.metadata) {
-    throw new Error('Project video not found.');
-  }
+  const maxSegEnd = params.captions.reduce((m, s) => Math.max(m, s.end || 0), 10);
+  const totalDuration = Math.max(
+    1,
+    Number(params.totalDuration) || project?.metadata?.duration || maxSegEnd
+  );
+
   const hasSpeakable = params.captions.some((seg) => {
     const txt = (params.useTranslated && seg.translatedText ? seg.translatedText : seg.text).trim();
     return txt.length > 0 && hasSpeakableText(txt);
@@ -1122,6 +1178,7 @@ export function enqueueFishDubJob(params: {
     voiceConfig: params.voiceConfig,
     captions: params.captions,
     useTranslated: params.useTranslated,
+    totalDuration,
   });
   void processDubQueue();
   return job;
@@ -1138,10 +1195,7 @@ async function processDubQueue() {
       if (!job) continue;
 
       const project = getProject(task.projectId);
-      if (!project || !project.metadata) {
-        updateJob(task.jobId, { status: 'failed', error: 'Project or video metadata missing.' });
-        continue;
-      }
+      const totalDuration = project?.metadata?.duration || task.totalDuration || 30;
 
       updateJob(task.jobId, {
         status: 'processing',
@@ -1155,27 +1209,40 @@ async function processDubQueue() {
           captions: task.captions,
           voiceConfig: task.voiceConfig,
           useTranslated: task.useTranslated,
-          totalDuration: project.metadata.duration,
+          totalDuration,
           onProgress: (progress, stage, etaSeconds) => {
             updateJob(task.jobId, { progress, stage, etaSeconds });
           },
         });
 
-        const latestProject = getProject(task.projectId) || project;
-        updateProject(task.projectId, {
+        const latestProject = getProject(task.projectId);
+        const voicePatch: Partial<VoiceConfig> = {
+          ...(latestProject?.voice || {}),
+          ...task.voiceConfig,
+          provider: 'fish',
+          syncMode: generated.syncPlan.syncMode,
+          continuousPauseMs:
+            generated.syncPlan.pauseDurationMs ?? task.voiceConfig.continuousPauseMs,
+          speakingSpeed: 1.0,
+          enabled: true,
+          generatedClips: generated.clips,
+          fullDubUrl: generated.fullDubUrl,
+          syncPlan: generated.syncPlan,
+        };
+
+        if (latestProject) {
+          updateProject(task.projectId, {
+            captions: task.captions,
+            voice: {
+              ...latestProject.voice,
+              ...voicePatch,
+            },
+          });
+        }
+
+        dubJobResults.set(task.jobId, {
           captions: task.captions,
-          voice: {
-            ...latestProject.voice,
-            ...task.voiceConfig,
-            provider: 'fish',
-            syncMode: generated.syncPlan.syncMode,
-            continuousPauseMs: generated.syncPlan.pauseDurationMs ?? latestProject.voice.continuousPauseMs,
-            speakingSpeed: 1.0,
-            enabled: true,
-            generatedClips: generated.clips,
-            fullDubUrl: generated.fullDubUrl,
-            syncPlan: generated.syncPlan,
-          },
+          voicePatch,
         });
 
         const dubSize = fs.existsSync(generated.fullDubPath)
@@ -1329,6 +1396,7 @@ export async function regenerateFishSegments(params: {
   captions?: CaptionSegment[];
   voiceConfig?: Partial<VoiceConfig>;
   useTranslated?: boolean;
+  totalDuration?: number;
 }): Promise<{
   project: Project;
   regeneratedIds: string[];
@@ -1340,8 +1408,12 @@ export async function regenerateFishSegments(params: {
   getFishApiKey();
 
   const existingProject = getProject(params.projectId);
-  if (!existingProject || !existingProject.metadata) {
-    throw new Error('Project video not found.');
+  const captions =
+    Array.isArray(params.captions) && params.captions.length > 0
+      ? params.captions
+      : existingProject?.captions || [];
+  if (captions.length === 0) {
+    throw new Error('No transcript segments found to regenerate.');
   }
 
   const targetIds = new Set(
@@ -1351,11 +1423,6 @@ export async function regenerateFishSegments(params: {
     throw new Error('Specify at least one segment ID to regenerate.');
   }
 
-  const captions =
-    Array.isArray(params.captions) && params.captions.length > 0
-      ? params.captions
-      : existingProject.captions;
-
   const missingRequested = Array.from(targetIds).filter(
     (id) => !captions.some((c) => c.id === id)
   );
@@ -1364,7 +1431,7 @@ export async function regenerateFishSegments(params: {
   }
 
   const mergedVoice: VoiceConfig = {
-    ...existingProject.voice,
+    ...(existingProject?.voice || ({} as VoiceConfig)),
     ...(params.voiceConfig || {}),
     provider: 'fish',
     speakingSpeed: 1.0,
@@ -1439,6 +1506,12 @@ export async function regenerateFishSegments(params: {
     throw new Error('No speakable segments available to merge into the dubbing track.');
   }
 
+  const maxSegEnd = captions.reduce((m, s) => Math.max(m, s.end || 0), 10);
+  const originalDuration = Math.max(
+    1,
+    Number(params.totalDuration) || existingProject?.metadata?.duration || maxSegEnd
+  );
+
   const rawClips = outputs.map((o) => o.clip);
   const syncMode: SyncMode = normalizeSyncMode(mergedVoice.syncMode);
   const continuousPauseMs = clampContinuousPauseMs(mergedVoice.continuousPauseMs);
@@ -1453,7 +1526,7 @@ export async function regenerateFishSegments(params: {
       leadingSilence: c.leadingSilence,
       trailingSilence: c.trailingSilence,
     })),
-    originalVideoDuration: existingProject.metadata.duration,
+    originalVideoDuration: originalDuration,
     syncMode,
     continuousPauseMs,
   });
@@ -1495,28 +1568,37 @@ export async function regenerateFishSegments(params: {
     sizeBytes: dubStat.size,
   });
 
-  const remainingPending = (existingProject.translation.pendingRegenerateSegmentIds || []).filter(
+  const remainingPending = (existingProject?.translation?.pendingRegenerateSegmentIds || []).filter(
     (id) => !targetIds.has(id)
   );
 
-  const updatedProject =
-    updateProject(params.projectId, {
+  const nextVoice: VoiceConfig = {
+    ...mergedVoice,
+    syncMode,
+    continuousPauseMs,
+    speakingSpeed: 1.0,
+    enabled: true,
+    generatedClips: clips,
+    fullDubUrl,
+    syncPlan,
+  };
+
+  const updatedProject: Project =
+    (existingProject &&
+      updateProject(params.projectId, {
+        captions,
+        translation: {
+          ...existingProject.translation,
+          pendingRegenerateSegmentIds: remainingPending,
+        },
+        voice: nextVoice,
+      })) ||
+    ({
+      ...(existingProject || ({} as Project)),
+      id: params.projectId,
       captions,
-      translation: {
-        ...existingProject.translation,
-        pendingRegenerateSegmentIds: remainingPending,
-      },
-      voice: {
-        ...mergedVoice,
-        syncMode,
-        continuousPauseMs,
-        speakingSpeed: 1.0,
-        enabled: true,
-        generatedClips: clips,
-        fullDubUrl,
-        syncPlan,
-      },
-    }) || existingProject;
+      voice: nextVoice,
+    } as Project);
 
   return {
     project: updatedProject,

@@ -52,18 +52,31 @@
 
 ## Environment Variables
 
-Configure via `.env` or the platform Secrets panel (see `.env.example`):
+Configure via a local `.env` file (ignored by Git via `.gitignore`) or your hosting provider's environment variables / Secrets panel (never expose secret keys in `VITE_*` variables):
 
-- `GEMINI_API_KEY`: Required for server-side AI transcription, translation, and TTS voice generation.
-- `STORAGE_DIR`: Directory for uploaded media, audio, masks, and exported MP4s (default `./storage`).
-- `MAX_UPLOAD_SIZE_MB`: Maximum upload limit in MB (default `2048`).
-- `TEMP_RETENTION_HOURS`: Automatic temp file cleanup threshold in hours (default `24`).
+- `FISH_AUDIO_API_KEY`: Required on the backend for Fish Audio ASR transcription, voice library browsing, and `s2.1-pro-free` MP3 dubbing (`/api/fish/*`, `/api/projects/:id/dubbing/*`).
+- `FISH_API_BASE_URL`: Optional Fish Audio API base URL (default `https://api.fish.audio`).
+- `GEMINI_API_KEY`: Required for server-side automated AI translation.
+- `STORAGE_DIR`: Directory for temporary audio/server assets (default `./storage`).
+
+### Deploying with Fish Audio API
+
+If you deploy the Express backend to a hosting provider (e.g. Render, Railway, Cloud Run, or Fly.io):
+1. Open your backend service **Environment Variables** (or **Secrets**) panel.
+2. Add `FISH_AUDIO_API_KEY` with your Fish Audio key (do **not** prefix it with `VITE_`).
+3. On your Cloudflare Pages frontend project, set `VITE_API_BASE_URL` to your deployed backend URL (e.g. `https://your-backend.onrender.com`) so Fish Audio requests proxy through the backend without ever exposing the API key in the browser.
 
 ## Running Locally
 
-```bash
-npm install
-npm run dev
-```
+1. Add your key in `.env`:
+   ```env
+   FISH_AUDIO_API_KEY=your_key_here
+   ```
+2. Install dependencies and start the server:
+   ```bash
+   npm install
+   npm run dev
+   ```
 
 The server listens on `http://localhost:3000`.
+

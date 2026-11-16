@@ -24,7 +24,7 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: FISH_API_KEY
+      - key: FISH_AUDIO_API_KEY
         sync: false
       - key: FISH_API_BASE_URL
         value: https://api.fish.audio

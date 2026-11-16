@@ -173,7 +173,7 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
                   Fish Audio Dubbing API (Server-Side Key Required)
                 </div>
                 <div className="text-zinc-500 mt-0.5">
-                  Automated cloud voice dubbing requires an AI backend with FISH_API_KEY so secrets are never shipped in browser JavaScript.
+                  Automated cloud voice dubbing requires a backend with FISH_AUDIO_API_KEY set in server environment variables so secrets are never shipped in browser JavaScript.
                 </div>
               </div>
               <div className="flex items-center gap-1.5 shrink-0 font-medium">
@@ -203,7 +203,7 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
           </h2>
         </div>
         <p className="text-xs text-zinc-400 leading-relaxed">
-          All video files, thumbnails, audio tracks, logos, and rendered exports remain strictly inside your browser (File API + IndexedDB) and are never uploaded to Cloudflare Pages. Secret keys such as <code className="text-zinc-200">GEMINI_API_KEY</code> and <code className="text-zinc-200">FISH_API_KEY</code> are never included in frontend bundles.
+          All video files, thumbnails, audio tracks, logos, and rendered exports remain strictly inside your browser (File API + IndexedDB) and are never uploaded to Cloudflare Pages. Secret keys such as <code className="text-zinc-200">GEMINI_API_KEY</code> and <code className="text-zinc-200">FISH_AUDIO_API_KEY</code> are never included in frontend bundles.
         </p>
       </section>
 

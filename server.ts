@@ -91,11 +91,13 @@ import {
   generateDubDiagnosticReport,
   generateFishSynchronizedDub,
   generateFishVoicePreview,
+  getFishDubJobResult,
   inspectFullDubTrackDiagnostics,
   isFishAudioConfigured,
   listFishVoices,
   regenerateFishSegments,
   resyncExistingFishClips,
+  synthesizeFishMp3Buffer,
   transcribeVideoWithFishAudio,
 } from './server/services/fish_audio_service.ts';
 import {
@@ -390,6 +392,81 @@ app.get('/api/system/storage-usage', (_req, res) => {
     res.json(computeLocalStorageUsage());
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Fish Audio Backend Status & Direct Proxy Endpoints (reads process.env.FISH_AUDIO_API_KEY exclusively on backend)
+app.get('/api/fish/status', (_req, res) => {
+  res.json({
+    configured: isFishAudioConfigured(),
+    ttsModel: 's2.1-pro-free',
+    asrModel: 'transcribe-1-pro',
+  });
+});
+
+app.post('/api/fish/tts', async (req, res) => {
+  try {
+    const text = String(req.body?.text || '').trim();
+    if (!text) {
+      res.status(400).json({ error: 'text is required for Fish Audio TTS.' });
+      return;
+    }
+    const referenceId =
+      typeof req.body?.referenceId === 'string'
+        ? req.body.referenceId
+        : typeof req.body?.reference_id === 'string'
+        ? req.body.reference_id
+        : undefined;
+    const rawFormat = String(req.body?.format || 'mp3').toLowerCase();
+    const format = (['mp3', 'wav', 'pcm', 'opus'].includes(rawFormat) ? rawFormat : 'mp3') as
+      | 'mp3'
+      | 'wav'
+      | 'pcm'
+      | 'opus';
+
+    const audioBuffer = await synthesizeFishMp3Buffer({
+      text,
+      referenceId,
+      format,
+    });
+
+    const contentTypeMap = {
+      mp3: 'audio/mpeg',
+      wav: 'audio/wav',
+      pcm: 'audio/pcm',
+      opus: 'audio/ogg',
+    };
+    res.setHeader('Content-Type', contentTypeMap[format]);
+    res.setHeader('Content-Length', String(audioBuffer.length));
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(audioBuffer);
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode || 500;
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/fish/asr', uploadMem.single('audio'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer || req.file.buffer.length === 0) {
+      res.status(400).json({ error: 'Multipart audio file ("audio") is required for Fish Audio ASR.' });
+      return;
+    }
+    const duration = Math.max(1, Number(req.body?.duration) || 10);
+    const sourceLanguage =
+      typeof req.body?.sourceLanguage === 'string' ? req.body.sourceLanguage : undefined;
+    const result = await transcribeVideoWithFishAudio({
+      audioBuffer: req.file.buffer,
+      audioFilename: req.file.originalname || 'audio.wav',
+      projectId: String(req.body?.projectId || 'direct_asr'),
+      duration,
+      hasAudio: true,
+      sourceLanguage,
+    });
+    res.json(result);
+  } catch (err) {
+    const status = (err as { statusCode?: number }).statusCode || 500;
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -1366,43 +1443,69 @@ app.post('/api/projects/:id/transcribe', async (req, res) => {
   }
 });
 
-// Dedicated Fish Audio ASR Transcription Route
-app.post('/api/projects/:id/dubbing/transcribe', async (req, res) => {
+// Dedicated Fish Audio ASR Transcription Route (supports server-stored video OR multipart extracted audio from browser)
+app.post('/api/projects/:id/dubbing/transcribe', uploadMem.single('audio'), async (req, res) => {
   try {
     const project = getProject(req.params.id);
-    if (!project || !project.sourceVideoUrl || !project.metadata) {
-      res.status(404).json({ error: 'Upload a video before running Fish Audio transcription.' });
-      return;
-    }
-    const asset = getAssetByUrl(project.sourceVideoUrl);
-    if (!asset) {
-      res.status(404).json({ error: 'Source video file not found.' });
-      return;
-    }
-
     const sourceLanguage =
       typeof req.body?.sourceLanguage === 'string'
         ? req.body.sourceLanguage
-        : project.translation.sourceLanguage;
+        : project?.translation?.sourceLanguage;
 
-    const result = await transcribeVideoWithFishAudio({
-      videoPath: asset.file_path,
-      projectId: project.id,
-      duration: project.metadata.duration,
-      hasAudio: project.metadata.hasAudio,
-      sourceLanguage,
-    });
+    let result: { segments: import('./src/types/studio.ts').CaptionSegment[]; detectedLanguage: string };
 
-    const updated = updateProject(project.id, {
-      captions: result.segments,
-      translation: {
-        ...project.translation,
-        sourceLanguage: result.detectedLanguage,
-      },
-    });
+    if (req.file && req.file.buffer && req.file.buffer.length > 0) {
+      const duration = Math.max(1, Number(req.body?.duration) || project?.metadata?.duration || 10);
+      result = await transcribeVideoWithFishAudio({
+        audioBuffer: req.file.buffer,
+        audioFilename: req.file.originalname || 'browser_audio.wav',
+        projectId: req.params.id,
+        duration,
+        hasAudio: true,
+        sourceLanguage,
+      });
+    } else {
+      if (!project || !project.sourceVideoUrl || !project.metadata) {
+        res.status(404).json({
+          error: 'Upload a video or send extracted browser audio before running Fish Audio transcription.',
+        });
+        return;
+      }
+      const asset = getAssetByUrl(project.sourceVideoUrl);
+      if (!asset) {
+        res.status(404).json({ error: 'Source video file not found.' });
+        return;
+      }
+      result = await transcribeVideoWithFishAudio({
+        videoPath: asset.file_path,
+        projectId: project.id,
+        duration: project.metadata.duration,
+        hasAudio: project.metadata.hasAudio,
+        sourceLanguage,
+      });
+    }
+
+    const updated =
+      project &&
+      updateProject(project.id, {
+        captions: result.segments,
+        translation: {
+          ...project.translation,
+          sourceLanguage: result.detectedLanguage,
+        },
+      });
 
     res.json({
-      project: updated,
+      project: updated || {
+        id: req.params.id,
+        captions: result.segments,
+        translation: {
+          sourceLanguage: result.detectedLanguage,
+          targetLanguage: 'French',
+          preserveProperNouns: true,
+          lastTranslatedAt: null,
+        },
+      },
       detectedLanguage: result.detectedLanguage,
       segmentCount: result.segments.length,
     });
@@ -1416,10 +1519,6 @@ app.post('/api/projects/:id/dubbing/transcribe', async (req, res) => {
 app.post('/api/projects/:id/dubbing/preview', async (req, res) => {
   try {
     const project = getProject(req.params.id);
-    if (!project) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
     const text = String(req.body?.text || '').trim();
     if (!text) {
       res.status(400).json({ error: 'Preview text is required' });
@@ -1428,9 +1527,9 @@ app.post('/api/projects/:id/dubbing/preview', async (req, res) => {
     const referenceId =
       typeof req.body?.referenceId === 'string'
         ? req.body.referenceId
-        : project.voice.fishReferenceId;
+        : project?.voice?.fishReferenceId;
     const preview = await generateFishVoicePreview({
-      projectId: project.id,
+      projectId: req.params.id,
       text,
       referenceId,
       speakingSpeed: 1.0,
@@ -1447,39 +1546,42 @@ app.post('/api/projects/:id/dubbing/preview', async (req, res) => {
 app.post('/api/projects/:id/dubbing/generate', (req, res) => {
   try {
     const project = getProject(req.params.id);
-    if (!project || !project.metadata) {
-      res.status(404).json({ error: 'Project video not found' });
-      return;
-    }
+    const captions = Array.isArray(req.body?.captions)
+      ? req.body.captions
+      : project?.captions || [];
 
     const voiceConfig = {
-      ...project.voice,
+      ...(project?.voice || ({} as Project['voice'])),
       ...(req.body?.voice || {}),
       provider: 'fish' as const,
-      syncMode: normalizeSyncMode(req.body?.voice?.syncMode ?? project.voice.syncMode),
+      syncMode: normalizeSyncMode(req.body?.voice?.syncMode ?? project?.voice?.syncMode),
       continuousPauseMs: clampContinuousPauseMs(
-        req.body?.voice?.continuousPauseMs ?? project.voice.continuousPauseMs
+        req.body?.voice?.continuousPauseMs ?? project?.voice?.continuousPauseMs
       ),
       speakingSpeed: 1.0,
       enabled: true,
     };
 
-    const captions = Array.isArray(req.body?.captions) ? req.body.captions : project.captions;
     const useTranslated =
       req.body?.useTranslated !== undefined
         ? Boolean(req.body.useTranslated)
         : true;
+    const totalDuration =
+      Number(req.body?.totalDuration) || project?.metadata?.duration || undefined;
 
-    updateProject(project.id, {
-      captions,
-      voice: voiceConfig,
-    });
+    if (project) {
+      updateProject(project.id, {
+        captions,
+        voice: voiceConfig,
+      });
+    }
 
     const job = enqueueFishDubJob({
-      projectId: project.id,
+      projectId: req.params.id,
       voiceConfig,
       captions,
       useTranslated,
+      totalDuration,
     });
 
     res.status(202).json({ job });
@@ -1493,52 +1595,56 @@ app.post('/api/projects/:id/dubbing/generate', (req, res) => {
 app.post('/api/projects/:id/dubbing/resync', async (req, res) => {
   try {
     const project = getProject(req.params.id);
-    if (!project || !project.metadata) {
-      res.status(404).json({ error: 'Project video not found.' });
+    const voiceInput = req.body?.voice || project?.voice;
+    const captions = Array.isArray(req.body?.captions)
+      ? req.body.captions
+      : project?.captions || [];
+    const totalDuration = Number(req.body?.totalDuration) || project?.metadata?.duration;
+
+    if (!voiceInput || !totalDuration) {
+      res.status(404).json({ error: 'Project video metadata not found.' });
       return;
     }
 
-    const syncMode: SyncMode = normalizeSyncMode(req.body?.syncMode ?? project.voice.syncMode);
+    const syncMode: SyncMode = normalizeSyncMode(req.body?.syncMode ?? voiceInput.syncMode);
     const continuousPauseMs = clampContinuousPauseMs(
-      req.body?.continuousPauseMs ?? project.voice.continuousPauseMs
+      req.body?.continuousPauseMs ?? voiceInput.continuousPauseMs
     );
 
-    if (project.voice.generatedClips && project.voice.generatedClips.length > 0) {
+    if (voiceInput.generatedClips && voiceInput.generatedClips.length > 0) {
       const resynced = await resyncExistingFishClips({
-        projectId: project.id,
-        captions: project.captions,
-        voiceConfig: project.voice,
-        originalDuration: project.metadata.duration,
+        projectId: req.params.id,
+        captions,
+        voiceConfig: voiceInput,
+        originalDuration: totalDuration,
         syncMode,
         continuousPauseMs,
       });
 
-      const updated = updateProject(project.id, {
-        voice: {
-          ...project.voice,
-          syncMode,
-          continuousPauseMs,
-          speakingSpeed: 1.0,
-          generatedClips: resynced.clips,
-          fullDubUrl: resynced.fullDubUrl,
-          syncPlan: resynced.syncPlan,
-        },
-      });
-      res.json({ project: updated });
+      const nextVoice = {
+        ...voiceInput,
+        syncMode,
+        continuousPauseMs,
+        speakingSpeed: 1.0,
+        generatedClips: resynced.clips,
+        fullDubUrl: resynced.fullDubUrl,
+        syncPlan: resynced.syncPlan,
+      };
+      const updated = project ? updateProject(project.id, { voice: nextVoice }) : null;
+      res.json({ project: updated || { id: req.params.id, voice: nextVoice } });
       return;
     }
 
-    const updated = updateProject(project.id, {
-      voice: {
-        ...project.voice,
-        syncMode,
-        continuousPauseMs,
-        syncPlan: project.voice.syncPlan
-          ? { ...project.voice.syncPlan, syncMode, pauseDurationMs: continuousPauseMs }
-          : undefined,
-      },
-    });
-    res.json({ project: updated });
+    const nextVoice = {
+      ...voiceInput,
+      syncMode,
+      continuousPauseMs,
+      syncPlan: voiceInput.syncPlan
+        ? { ...voiceInput.syncPlan, syncMode, pauseDurationMs: continuousPauseMs }
+        : undefined,
+    };
+    const updated = project ? updateProject(project.id, { voice: nextVoice }) : null;
+    res.json({ project: updated || { id: req.params.id, voice: nextVoice } });
   } catch (err) {
     const status = (err as { statusCode?: number }).statusCode || 500;
     res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
@@ -1572,6 +1678,8 @@ app.post('/api/projects/:id/dubbing/regenerate-segments', async (req, res) => {
       voiceConfig: req.body?.voice,
       useTranslated:
         req.body?.useTranslated !== undefined ? Boolean(req.body.useTranslated) : undefined,
+      totalDuration:
+        typeof req.body?.totalDuration === 'number' ? req.body.totalDuration : undefined,
     });
     res.json(result);
   } catch (err) {
@@ -2074,7 +2182,8 @@ app.get('/api/jobs/:jobId', (req, res) => {
     res.status(404).json({ error: 'Job not found' });
     return;
   }
-  res.json({ job });
+  const dubResult = getFishDubJobResult(job.id);
+  res.json(dubResult ? { job, dubResult } : { job });
 });
 
 app.get('/api/jobs', (_req, res) => {
