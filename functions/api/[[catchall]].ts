@@ -624,6 +624,66 @@ async function handleGeminiTest(request: Request, env: PagesEnv): Promise<Respon
   });
 }
 
+async function handleGeminiShorten(request: Request, env: PagesEnv): Promise<Response> {
+  const apiKey = readGeminiKey(request, env);
+  if (!apiKey) {
+    return jsonResponse(request, { error: 'Gemini API key is required.' }, 401);
+  }
+  let body: { prompt?: string };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return jsonResponse(request, { error: 'Invalid JSON body.' }, 400);
+  }
+  const prompt = String(body?.prompt || '');
+  try {
+    const result = await fetchGeminiGenerateContent(apiKey, {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    });
+    if (!result.response.ok) {
+      return jsonResponse(request, { error: 'Gemini shortening failed.' }, 502);
+    }
+    const data = (await result.response.json().catch(() => ({}))) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+    return jsonResponse(request, { text });
+  } catch (err) {
+    return jsonResponse(request, { error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+}
+
+async function handleGeminiThumbnailSuggest(request: Request, env: PagesEnv): Promise<Response> {
+  const apiKey = readGeminiKey(request, env);
+  if (!apiKey) {
+    return jsonResponse(request, { error: 'Gemini API key is required.' }, 401);
+  }
+  let body: { prompt?: string };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    body = {};
+  }
+  const prompt = String(body?.prompt || 'Suggest catchy thumbnail hooks.');
+  try {
+    const result = await fetchGeminiGenerateContent(apiKey, {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    });
+    if (!result.response.ok) {
+      return jsonResponse(request, { error: 'Gemini thumbnail suggest failed.' }, 502);
+    }
+    const data = (await result.response.json().catch(() => ({}))) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    return jsonResponse(request, { text });
+  } catch (err) {
+    return jsonResponse(request, { error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+}
+
 async function handleGeminiTranslate(
   request: Request,
   env: PagesEnv,
@@ -829,6 +889,14 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
       );
     }
     return handleGeminiTest(request, env);
+  }
+
+  if (path === '/api/gemini/shorten' && request.method === 'POST') {
+    return handleGeminiShorten(request, env);
+  }
+
+  if (path === '/api/gemini/thumbnail-suggest' && request.method === 'POST') {
+    return handleGeminiThumbnailSuggest(request, env);
   }
 
   if (path === '/api/fish/status' && request.method === 'GET') {

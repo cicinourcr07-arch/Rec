@@ -282,7 +282,29 @@ export interface SubtitleStyle {
 }
 
 export type BlurMode = 'full' | 'background' | 'selective' | 'motion';
-export type BlurType = 'gaussian' | 'box' | 'pixelate';
+export type BlurType =
+  | 'gaussian'
+  | 'motion'
+  | 'pixelate'
+  | 'face'
+  | 'object'
+  | 'background'
+  | 'directional'
+  | 'radial'
+  | 'custom'
+  | 'box'; // legacy map
+
+export type BlurShape = 'rect' | 'circle' | 'ellipse' | 'polygon' | 'freehand' | 'brush';
+
+export interface BlurPoint {
+  x: number;
+  y: number;
+}
+
+export interface BlurBrushStroke {
+  points: BlurPoint[];
+  size: number;
+}
 
 export interface TrackingKeyframe {
   time: number;
@@ -290,6 +312,9 @@ export interface TrackingKeyframe {
   y: number; // normalized 0..1
   width: number; // normalized 0..1
   height: number; // normalized 0..1
+  rotation?: number;
+  opacity?: number;
+  intensity?: number;
 }
 
 export interface BlurEffect {
@@ -302,7 +327,11 @@ export interface BlurEffect {
   radius: number; // 2..50
   opacity: number; // 0.1..1.0 transparency/blend
   feather?: number; // 0..30 soft edge blend
+  edgeSoftness?: number;
+  expandPx?: number; // -40..+80 dilation/contraction
   rotation?: number; // -180..180 degrees
+  directionAngle?: number;
+  invertMask?: boolean;
   locked?: boolean;
   zIndex?: number;
   startTime: number;
@@ -311,7 +340,10 @@ export interface BlurEffect {
   y: number; // normalized 0..1
   width: number; // normalized 0..1
   height: number; // normalized 0..1
-  shape: 'rect' | 'ellipse';
+  shape: BlurShape;
+  points?: BlurPoint[];
+  brushStrokes?: BlurBrushStroke[];
+  brushSize?: number;
   keyframes?: TrackingKeyframe[];
   maskAssetId?: string;
 }
@@ -349,7 +381,26 @@ export type VoiceGender = 'male' | 'female';
 export type GeminiVoiceName = 'Puck' | 'Charon' | 'Fenrir' | 'Kore' | 'Zephyr';
 export type DubbingProvider = 'fish' | 'gemini';
 export type SyncMode = 'flexible' | 'original' | 'continuous';
-export type NarrationStyle = 'cinematic' | 'natural';
+export type NarrationStyle = 'cinematic' | 'natural' | 'energetic';
+
+export type DurationMismatchMode =
+  | 'keep-audio-freeze-last'
+  | 'loop-visual'
+  | 'trim-video-to-audio'
+  | 'match-visual-duration';
+
+export interface VideoSpeedSection {
+  id: string;
+  startTime: number;
+  endTime: number;
+  speed: number;
+}
+
+export interface VideoSpeedConfig {
+  globalSpeed: number;
+  sections: VideoSpeedSection[];
+  mismatchMode: DurationMismatchMode;
+}
 
 export interface VideoExtensionHold {
   id: string;
@@ -848,6 +899,7 @@ export interface Project {
   logos: LogoOverlay[];
   videoEffects: VideoEffectsConfig;
   canvas?: VideoCanvasConfig;
+  videoSpeed?: VideoSpeedConfig;
   workflow?: ProjectWorkflowState;
   exportSettings: ExportSettings;
   lastExportUrl: string | null;

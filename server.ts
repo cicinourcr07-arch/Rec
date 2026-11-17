@@ -479,6 +479,84 @@ app.post('/api/gemini/test', async (req, res) => {
   }
 });
 
+app.post('/api/gemini/shorten', async (req, res) => {
+  const apiKey = resolveGeminiApiKey(extractGeminiHeaderToken(req));
+  if (!apiKey) {
+    res.status(401).json({ error: 'Gemini API key is required for server shortening.' });
+    return;
+  }
+  try {
+    const prompt = String(req.body?.prompt || '');
+    const models = ['gemini-3.8-flash', 'gemini-2.5-flash'] as const;
+    let geminiRes: globalThis.Response | null = null;
+    for (const model of models) {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: 'application/json' },
+          }),
+        }
+      );
+      geminiRes = r;
+      if (r.ok || r.status !== 404) break;
+    }
+    if (!geminiRes || !geminiRes.ok) {
+      res.status(502).json({ error: 'Failed to reach Gemini for shortening.' });
+      return;
+    }
+    const data = (await geminiRes.json().catch(() => ({}))) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+    res.json({ text });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/gemini/thumbnail-suggest', async (req, res) => {
+  const apiKey = resolveGeminiApiKey(extractGeminiHeaderToken(req));
+  if (!apiKey) {
+    res.status(401).json({ error: 'Gemini API key is required.' });
+    return;
+  }
+  try {
+    const prompt = String(req.body?.prompt || 'Suggest catchy YouTube/TikTok thumbnail hooks and color palettes in JSON format.');
+    const models = ['gemini-3.8-flash', 'gemini-2.5-flash'] as const;
+    let geminiRes: globalThis.Response | null = null;
+    for (const model of models) {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: 'application/json' },
+          }),
+        }
+      );
+      geminiRes = r;
+      if (r.ok || r.status !== 404) break;
+    }
+    if (!geminiRes || !geminiRes.ok) {
+      res.status(502).json({ error: 'Failed to reach Gemini.' });
+      return;
+    }
+    const data = (await geminiRes.json().catch(() => ({}))) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    res.json({ text });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.all('/api/gemini/test', (_req, res) => {
   res
     .setHeader('Allow', 'POST')
