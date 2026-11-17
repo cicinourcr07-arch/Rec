@@ -38,8 +38,9 @@
 - **Personal Fish Audio API Key Storage**: `src/lib/fishKeyStore.ts` stores the user's personal Fish Audio API key locally inside browser IndexedDB (`recap_studio_personal_keys_v1`) when **Remember API Key on this device** is enabled, or in memory for the current session only. It is never uploaded to any database, exported in project backups, logged, or committed to GitHub.
 - **Cloudflare Pages Functions**:
   - `functions/api/fish-audio.js`: Accepts `POST /api/fish-audio` requests only over HTTPS from the same origin, reads the user's personal key from the `Authorization: Bearer <token>` header, supports real connection verification (`{ action: "test" }` against `POST https://api.fish.audio/v1/tts`), and forwards TTS requests to `https://api.fish.audio/v1/tts` without logging or persisting the key.
-  - `functions/api/[[catchall]].ts`: Handles `/api/system/status`, `/api/fish/status`, `/api/fish/voices`, `/api/fish/asr`, `/api/projects/:id/dubbing/*`, and `/api/projects/:id/translate` directly on Cloudflare Pages Functions.
-  - `public/_routes.json`: Copied into `dist/_routes.json` during `npm run build` so Cloudflare Pages explicitly routes `/api/*`, `/media/*`, and `/storage/*` to Pages Functions instead of static asset handlers.
+  - `functions/api/[[catchall]].ts`: Handles `/api/health`, `/api/system/status`, `/api/fish/status`, `/api/fish/voices`, `/api/fish/asr`, `/api/gemini/test`, `/api/projects/:id/dubbing/*`, and `/api/projects/:id/translate` directly on Cloudflare Pages Functions.
+  - `public/_routes.json`: Copied into `dist/_routes.json` during `npm run build` so Cloudflare Pages explicitly routes `/api/*` and `/media/*` to Pages Functions instead of serving `index.html`.
+  - `wrangler.toml`: Declares `pages_build_output_dir = "dist"` at the repository root alongside `/functions`.
 - **Local Express Dev Server**: `server.ts` + `server/services/` (port `3000`)
 
 ## Configuration & Personal API Keys
@@ -52,14 +53,21 @@
   - `FISH_API_BASE_URL`: Optional Fish Audio API base URL (default `https://api.fish.audio`).
   - `GEMINI_API_KEY`: Optional key for server-side automated AI translation.
 
-### Deploying to Cloudflare Pages (GitHub Integration)
+### Deploying to Cloudflare Pages (Git Integration or Wrangler)
 
-1. Push the full repository (including `functions/api/fish-audio.js`, `functions/api/[[catchall]].ts`, and `public/_routes.json`) to your GitHub branch (`.env` is excluded by `.gitignore`).
-2. In **Cloudflare Pages → Settings → Build & deployments**:
-   - **Root directory**: leave blank / `/` (so Cloudflare detects `/functions` at the repository root)
+> **Important**: Never upload only the `dist` folder as a static-only site—doing so omits the root `/functions` directory and causes `/api/*` routes to return `index.html`. Deploy from the repository root using **Git Integration** or **Wrangler**:
+
+1. Push the full repository root (including `functions/`, `public/_routes.json`, `wrangler.toml`, `src/`, and `package.json`) to GitHub.
+2. In **Cloudflare Dashboard → Workers & Pages → Create → Pages → Connect to Git**:
+   - **Root directory**: `/` (or leave blank)
    - **Build command**: `npm run build`
    - **Build output directory**: `dist`
-3. Verify the Cloudflare Pages build log shows Functions compiled (`functions/api/fish-audio.js`) and `dist/_routes.json` exists in the build output. No `FISH_AUDIO_API_KEY` environment variable needs to be configured in Cloudflare for personal API keys.
+3. Or deploy from the project root using Wrangler CLI:
+   ```bash
+   npm run build
+   npx wrangler pages deploy dist
+   ```
+4. After deployment, verify `/api/health` returns JSON (`{ "ok": true, ... }`) and `GET /api/fish/voices?q=arlond` returns JSON rather than HTML.
 
 ## Running Locally
 

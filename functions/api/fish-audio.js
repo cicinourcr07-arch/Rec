@@ -518,13 +518,25 @@ async function handlePostRequest(context) {
 
 export async function onRequest(context) {
   const requestUrl = new URL(context.request.url);
-  if (context.request.method.toUpperCase() === 'POST') {
-    return handlePostRequest(context);
+  try {
+    if (context.request.method.toUpperCase() === 'POST') {
+      return await handlePostRequest(context);
+    }
+    return jsonResponse(
+      requestUrl,
+      { error: 'Method Not Allowed. Only POST requests are accepted at /api/fish-audio.' },
+      405,
+      { Allow: 'POST' }
+    );
+  } catch (err) {
+    return jsonResponse(
+      requestUrl,
+      {
+        error: sanitizeMessage(
+          err instanceof Error ? err.message : 'Unexpected Fish Audio proxy error.'
+        ),
+      },
+      500
+    );
   }
-  return jsonResponse(
-    requestUrl,
-    { error: 'Method Not Allowed. Only POST requests are accepted at /api/fish-audio.' },
-    405,
-    { Allow: 'POST' }
-  );
 }

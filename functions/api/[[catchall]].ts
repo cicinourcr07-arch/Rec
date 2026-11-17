@@ -287,16 +287,26 @@ async function handleFishVoices(request: Request, env: PagesEnv, url: URL): Prom
     return jsonResponse(request, { error: 'Unable to connect to Fish Audio API.' }, 502);
   }
 
+  const rawText = await upstream.text().catch(() => '');
+  const upstreamCt = (upstream.headers.get('content-type') || '').toLowerCase();
+
   if (!upstream.ok) {
-    const errText = await upstream.text().catch(() => '');
     return jsonResponse(
       request,
-      { error: parseFishError(errText, upstream.status, apiKey) },
+      { error: parseFishError(rawText, upstream.status, apiKey) },
       upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502
     );
   }
 
-  const payload = (await upstream.json().catch(() => ({}))) as {
+  if (upstreamCt.includes('text/html') || isHtmlBody(rawText)) {
+    return jsonResponse(
+      request,
+      { error: 'Fish Audio upstream returned an HTML page instead of JSON.' },
+      502
+    );
+  }
+
+  let payload: {
     total?: number;
     items?: Array<{
       _id?: string;
@@ -309,7 +319,16 @@ async function handleFishVoices(request: Request, env: PagesEnv, url: URL): Prom
       cover_image?: string;
       author?: { nickname?: string; name?: string };
     }>;
-  };
+  } = {};
+  try {
+    payload = rawText ? (JSON.parse(rawText) as typeof payload) : {};
+  } catch {
+    return jsonResponse(
+      request,
+      { error: 'Fish Audio upstream returned a non-JSON response.' },
+      502
+    );
+  }
 
   const voices = (payload.items || [])
     .map((item) => ({
@@ -772,6 +791,8 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
   if (path === '/api/health' && request.method === 'GET') {
     return jsonResponse(request, {
       ok: true,
+      status: 'ok',
+      runtime: 'cloudflare-pages-functions',
       service: 'recap-studio-pages-functions',
       timestamp: new Date().toISOString(),
     });
@@ -811,7 +832,14 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
     });
   }
 
-  if (path === '/api/fish/voices' && request.method === 'GET') {
+  if (path === '/api/fish/voices') {
+    if (request.method !== 'GET') {
+      return jsonResponse(
+        request,
+        { error: 'Method Not Allowed. Only GET requests are accepted at /api/fish/voices.' },
+        405
+      );
+    }
     return handleFishVoices(request, env, url);
   }
 
@@ -897,35 +925,53 @@ export const onRequest = async (context: {
   params: { catchall?: string[] };
 }): Promise<Response> => {
   const { request, env } = context;
-  const backendBase = (
-    env.BACKEND_URL ||
-    env.VITE_API_BASE_URL ||
-    env.API_URL ||
-    ''
-  ).replace(/\/+$/, '');
-
-  if (!backendBase) {
-    return handlePagesApiRequest(request, env);
-  }
-
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders(request) });
-  }
-
-  const url = new URL(request.url);
-  const targetUrl = `${backendBase}${url.pathname}${url.search}`;
-  const forwardHeaders = new Headers(request.headers);
-  forwardHeaders.delete('host');
-  forwardHeaders.set('x-forwarded-host', url.host);
-  forwardHeaders.set('x-forwarded-proto', url.protocol.replace(':', ''));
-
   try {
+    const url = new URL(request.url);
+    const rawBackendBase = (
+      env.BACKEND_URL ||
+      env.VITE_API_BASE_URL ||
+      env.API_URL ||
+      ''
+    )
+      .trim()
+      .replace(/\/+$/, '');
+
+    // Ignore empty or self-referencing backend URLs so Pages Functions handle /api/* directly
+    const backendBase =
+      rawBackendBase && rawBackendBase !== url.origin ? rawBackendBase : '';
+
+    if (!backendBase) {
+      return await handlePagesApiRequest(request, env);
+    }
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
+    }
+
+    const targetUrl = `${backendBase}${url.pathname}${url.search}`;
+    const forwardHeaders = new Headers(request.headers);
+    forwardHeaders.delete('host');
+    forwardHeaders.set('x-forwarded-host', url.host);
+    forwardHeaders.set('x-forwarded-proto', url.protocol.replace(':', ''));
+
     const upstreamResponse = await fetch(targetUrl, {
       method: request.method,
       headers: forwardHeaders,
       body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
       redirect: 'follow',
     });
+
+    const upstreamCt = (upstreamResponse.headers.get('content-type') || '').toLowerCase();
+    if (upstreamCt.includes('text/html')) {
+      return jsonResponse(
+        request,
+        {
+          error: `Configured upstream backend (${backendBase}) returned HTML instead of JSON for ${url.pathname}.`,
+          code: 'UPSTREAM_HTML_ERROR',
+        },
+        502
+      );
+    }
 
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.set('Vary', 'Origin');
@@ -945,20 +991,16 @@ export const onRequest = async (context: {
       headers: responseHeaders,
     });
   } catch (err) {
-    return new Response(
-      JSON.stringify({
-        error: `Failed to proxy request to backend at ${backendBase}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-        code: 'UPSTREAM_PROXY_ERROR',
-      }),
+    return jsonResponse(
+      request,
       {
-        status: 502,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      }
+        error: sanitizeMessage(
+          err instanceof Error ? err.message : 'Unexpected Cloudflare Pages Function error.'
+        ),
+        code: 'PAGES_FUNCTION_ERROR',
+      },
+      500
     );
   }
 };
+
