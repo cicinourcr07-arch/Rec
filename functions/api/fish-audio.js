@@ -83,8 +83,8 @@ function validateHttpsAndOrigin(request, requestUrl) {
     };
   }
 
-  for (const param of SENSITIVE_QUERY_PARAMS) {
-    if (requestUrl.searchParams.has(param)) {
+  for (const key of requestUrl.searchParams.keys()) {
+    if (SENSITIVE_QUERY_PARAMS.includes(key.toLowerCase())) {
       return {
         ok: false,
         status: 400,
@@ -172,8 +172,10 @@ function parseUpstreamError(rawText, status, secretToRedact) {
       }
     }
   } catch {
-    if (rawText && rawText.trim() && status < 500) {
-      message = `${message} ${rawText.trim().slice(0, 180)}`;
+    const trimmed = (rawText || '').trim();
+    const looksHtml = /^<!doctype/i.test(trimmed) || /^<html/i.test(trimmed) || /<\/html>/i.test(trimmed);
+    if (trimmed && !looksHtml && status < 500) {
+      message = `${message} ${trimmed.slice(0, 180)}`;
     }
   }
 
@@ -311,7 +313,7 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
   });
 }
 
-export async function onRequestPost(context) {
+async function handlePostRequest(context) {
   const { request, env } = context;
   const requestUrl = new URL(request.url);
 
@@ -517,7 +519,7 @@ export async function onRequestPost(context) {
 export async function onRequest(context) {
   const requestUrl = new URL(context.request.url);
   if (context.request.method.toUpperCase() === 'POST') {
-    return onRequestPost(context);
+    return handlePostRequest(context);
   }
   return jsonResponse(
     requestUrl,

@@ -43,7 +43,7 @@ import {
   hydrateAssetToLocalBucket,
   inspectProjectAssets,
 } from './server/services/local_storage_service.ts';
-import { isGeminiConfigured } from './server/services/gemini_client.ts';
+import { isGeminiConfigured, resolveGeminiApiKey } from './server/services/gemini_client.ts';
 import {
   analyzeVideoFile,
   checkFfmpegCapabilities,
@@ -133,6 +133,14 @@ function extractBearerToken(req: express.Request): string | undefined {
   return token;
 }
 
+function extractGeminiHeaderToken(req: express.Request): string | undefined {
+  const raw = req.headers['x-gemini-api-key'];
+  if (typeof raw !== 'string') return undefined;
+  const token = raw.trim();
+  if (!token || /[\r\n\s]/.test(token)) return undefined;
+  return token;
+}
+
 function parseAllowedOrigins(): string[] {
   const raw = [
     process.env.CORS_ORIGINS,
@@ -188,7 +196,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
   res.header(
     'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range'
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Gemini-Api-Key, Range'
   );
   res.header(
     'Access-Control-Expose-Headers',
@@ -380,11 +388,11 @@ app.get('/media/:bucket/:filename', (req, res) => {
 });
 
 // System Diagnostics & Configuration Status
-app.get('/api/system/status', async (_req, res) => {
+app.get('/api/system/status', async (req, res) => {
   const caps = await checkFfmpegCapabilities();
   res.json({
-    geminiConfigured: isGeminiConfigured(),
-    fishConfigured: isFishAudioConfigured(),
+    geminiConfigured: isGeminiConfigured(extractGeminiHeaderToken(req)),
+    fishConfigured: Boolean(extractBearerToken(req) || isFishAudioConfigured()),
     ffmpegAvailable: caps.ffmpegAvailable,
     ffprobeAvailable: caps.ffprobeAvailable,
     ffmpegVersion: caps.ffmpegVersion,
@@ -394,6 +402,81 @@ app.get('/api/system/status', async (_req, res) => {
     supportedVideoFormats: ['MP4', 'MOV', 'MKV'],
     supportedLogoFormats: ['PNG', 'SVG'],
   });
+});
+
+app.post('/api/gemini/test', async (req, res) => {
+  const apiKey = resolveGeminiApiKey(extractGeminiHeaderToken(req));
+  if (!apiKey) {
+    res.status(401).json({
+      ok: false,
+      status: 'not_configured',
+      error:
+        'No Gemini API key configured. Add your personal Gemini API key in Settings -> Gemini API Settings, or use External Gemini (No Key) mode for free.',
+    });
+    return;
+  }
+  try {
+    const models = ['gemini-3.8-flash', 'gemini-4-hydrogen', 'gemini-2.5-flash'] as const;
+    let upstream: globalThis.Response | null = null;
+    let connectedModel: string = models[0];
+    for (const model of models) {
+      const resModel = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
+          apiKey
+        )}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: 'Reply with OK' }] }],
+            generationConfig: { maxOutputTokens: 8 },
+          }),
+        }
+      );
+      upstream = resModel;
+      connectedModel = model;
+      if (resModel.ok || resModel.status !== 404) {
+        break;
+      }
+    }
+    if (!upstream || !upstream.ok) {
+      const errText = upstream ? await upstream.text().catch(() => '') : '';
+      let msg = `Gemini API error (${upstream?.status || 502})`;
+      try {
+        const parsed = JSON.parse(errText) as { error?: { message?: string } };
+        if (parsed?.error?.message) msg = parsed.error.message;
+      } catch {
+        // ignore parse failure
+      }
+      msg = msg.split(apiKey).join('[redacted]').replace(/[?&]key=[^&\s"']+/gi, '?key=[redacted]');
+      const status = upstream?.status || 502;
+      const isAuth = status === 401 || status === 403 || /api key not valid/i.test(msg);
+      res.status(isAuth ? 401 : status >= 400 && status < 500 ? status : 502).json({
+        ok: false,
+        status: isAuth ? 'invalid_key' : 'connection_error',
+        error: isAuth ? 'Invalid Gemini API key or insufficient permissions.' : msg,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      status: 'connected',
+      message: `Connected to Gemini API (${connectedModel}).`,
+    });
+  } catch {
+    res.status(502).json({
+      ok: false,
+      status: 'connection_error',
+      error: 'Unable to reach Gemini API from server.',
+    });
+  }
+});
+
+app.all('/api/gemini/test', (_req, res) => {
+  res
+    .setHeader('Allow', 'POST')
+    .status(405)
+    .json({ error: 'Method Not Allowed. Only POST requests are accepted at /api/gemini/test.' });
 });
 
 
@@ -1776,6 +1859,7 @@ app.post('/api/projects/:id/translate', async (req, res) => {
       sourceLanguage,
       targetLanguage,
       preserveProperNouns,
+      apiKey: extractGeminiHeaderToken(req),
     });
 
     const translationMeta = {
@@ -2004,6 +2088,7 @@ app.post('/api/projects/:id/voice/auto-dub', async (req, res) => {
       sourceLanguage,
       targetLanguage,
       preserveProperNouns,
+      apiKey: extractGeminiHeaderToken(req),
     });
 
     // Step 3: Generate synchronized TTS voiceover in target language

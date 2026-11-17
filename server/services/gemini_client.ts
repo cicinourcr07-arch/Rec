@@ -1,21 +1,38 @@
 import { GoogleGenAI } from '@google/genai';
 
-export function isGeminiConfigured(): boolean {
-  const key = process.env.GEMINI_API_KEY;
-  return Boolean(key && key.trim().length > 0 && key !== 'MY_GEMINI_API_KEY');
+const PLACEHOLDER_KEYS = new Set(['your_key_here', 'my_gemini_api_key']);
+
+export function resolveGeminiApiKey(overrideKey?: string | null): string {
+  const cleanOverride = (overrideKey || '').trim();
+  if (cleanOverride && !PLACEHOLDER_KEYS.has(cleanOverride.toLowerCase())) {
+    return cleanOverride;
+  }
+  const envKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (envKey && !PLACEHOLDER_KEYS.has(envKey.toLowerCase())) {
+    return envKey;
+  }
+  return '';
 }
 
-export function getGeminiClient(apiVersion: 'v1' | 'v1beta' = 'v1beta'): GoogleGenAI {
-  if (!isGeminiConfigured()) {
+export function isGeminiConfigured(overrideKey?: string | null): boolean {
+  return Boolean(resolveGeminiApiKey(overrideKey));
+}
+
+export function getGeminiClient(
+  apiVersion: 'v1' | 'v1beta' = 'v1beta',
+  overrideKey?: string | null
+): GoogleGenAI {
+  const apiKey = resolveGeminiApiKey(overrideKey);
+  if (!apiKey) {
     const err = new Error(
-      'GEMINI_API_KEY is not configured on the server. Add GEMINI_API_KEY in the Settings > Secrets panel to enable AI transcription, translation, and voice generation.'
+      'GEMINI_API_KEY is not configured. Add your personal Gemini API key in Settings -> Gemini API Settings, or use the free External Gemini (No Key) workflow.'
     );
-    (err as Error & { statusCode?: number }).statusCode = 503;
+    (err as Error & { statusCode?: number }).statusCode = 401;
     throw err;
   }
 
   return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey,
     apiVersion,
     httpOptions: {
       headers: {

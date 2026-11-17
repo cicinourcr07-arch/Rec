@@ -735,6 +735,152 @@ function encodeAudioBufferToWavBlob(audioBuffer: AudioBuffer): Blob {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
+function encodeMono16kWavSlice(
+  channelData: Float32Array,
+  sampleRate: number,
+  startFrame: number,
+  endFrame: number
+): Blob {
+  const numFrames = Math.max(1, endFrame - startFrame);
+  const blockAlign = 2; // 1 channel * 16-bit PCM
+  const dataByteLength = numFrames * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataByteLength);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataByteLength, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataByteLength, true);
+
+  let offset = 44;
+  for (let i = startFrame; i < endFrame; i++) {
+    const s = Math.max(-1, Math.min(1, channelData[i] || 0));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+export interface BrowserAsrAudioChunk {
+  blob: Blob;
+  offsetSec: number;
+  durationSec: number;
+  filename: string;
+}
+
+/**
+ * Extracts speech audio as 16kHz mono PCM WAV and automatically splits long tracks
+ * into chunks under maxChunkBytes (default 18 MB) so Cloudflare Pages Functions and
+ * Fish Audio ASR never reject large videos.
+ */
+export async function extractBrowserAsrAudioChunks(params: {
+  sourceUri: string;
+  sourceFilename?: string | null;
+  maxChunkBytes?: number;
+}): Promise<BrowserAsrAudioChunk[]> {
+  const blob = await getMediaBlob(params.sourceUri);
+  if (!blob) {
+    throw new Error('Source video not found in browser storage.');
+  }
+  if (blob.size > AUDIO_EXTRACT_RAM_LIMIT_BYTES) {
+    throw new Error(
+      `Browser ASR audio decoding supports video files up to ${Math.round(
+        AUDIO_EXTRACT_RAM_LIMIT_BYTES / (1024 * 1024)
+      )} MB in browser RAM. Use "Compress Video" in Export Center (or upload a compressed MP4) to transcribe larger files.`
+    );
+  }
+
+  const Ctor = getAudioContextCtor();
+  if (!Ctor) {
+    throw new Error('Web Audio API (AudioContext) is not supported in this browser.');
+  }
+
+  const targetRate = 16000;
+  const maxChunkBytes = Math.max(2 * 1024 * 1024, params.maxChunkBytes ?? 18 * 1024 * 1024);
+  const maxFramesPerChunk = Math.floor((maxChunkBytes - 44) / 2);
+
+  const ctx = new Ctor();
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(arrayBuffer);
+
+    let monoData: Float32Array;
+    const OfflineCtor =
+      typeof window !== 'undefined'
+        ? window.OfflineAudioContext ||
+          (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
+            .webkitOfflineAudioContext
+        : undefined;
+
+    if (OfflineCtor && decoded.sampleRate !== targetRate) {
+      const targetFrames = Math.max(1, Math.ceil(decoded.duration * targetRate));
+      const offline = new OfflineCtor(1, targetFrames, targetRate);
+      const src = offline.createBufferSource();
+      src.buffer = decoded;
+      src.connect(offline.destination);
+      src.start(0);
+      const rendered = await offline.startRendering();
+      monoData = rendered.getChannelData(0);
+    } else {
+      // Mix down to mono at current rate (rare fallback)
+      const len = decoded.length;
+      const ch0 = decoded.getChannelData(0);
+      if (decoded.numberOfChannels > 1) {
+        const ch1 = decoded.getChannelData(1);
+        monoData = new Float32Array(len);
+        for (let i = 0; i < len; i++) {
+          monoData[i] = (ch0[i] + ch1[i]) * 0.5;
+        }
+      } else {
+        monoData = ch0;
+      }
+    }
+
+    const effectiveRate =
+      OfflineCtor && decoded.sampleRate !== targetRate ? targetRate : decoded.sampleRate;
+    const totalFrames = monoData.length;
+    const baseName = (params.sourceFilename || 'asr_audio').replace(/\.[^.]+$/, '');
+    const chunks: BrowserAsrAudioChunk[] = [];
+
+    let startFrame = 0;
+    let partIdx = 1;
+    while (startFrame < totalFrames) {
+      const endFrame = Math.min(totalFrames, startFrame + maxFramesPerChunk);
+      const wavBlob = encodeMono16kWavSlice(monoData, effectiveRate, startFrame, endFrame);
+      const offsetSec = startFrame / effectiveRate;
+      const durationSec = (endFrame - startFrame) / effectiveRate;
+      chunks.push({
+        blob: wavBlob,
+        offsetSec,
+        durationSec,
+        filename: `${baseName}_asr_part${partIdx}.wav`,
+      });
+      startFrame = endFrame;
+      partIdx++;
+    }
+
+    return chunks;
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+}
+
 export async function extractBrowserAudioTrack(params: {
   sourceUri: string;
   sourceFilename?: string | null;

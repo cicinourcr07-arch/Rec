@@ -21,6 +21,7 @@ import {
   Trash2,
   Volume2,
   Wand2,
+  Zap,
 } from 'lucide-react';
 import {
   CaptionSegment,
@@ -35,9 +36,11 @@ import {
 import { api, resolveApiUrl } from '../lib/api';
 import { formatBytes, formatTimecode } from '../lib/formatters';
 import { createWorkflowUpdate } from '../lib/workflowStages';
+import { normalizeSpeakerName } from '../lib/speakers';
 import { VideoStudioPlayer } from '../components/VideoStudioPlayer';
 import { ExternalGeminiTranslatorPanel } from '../components/ExternalGeminiTranslatorPanel';
 import { TimelineSyncCard } from '../components/TimelineSyncCard';
+import { SpeakersManagerPanel } from '../components/SpeakersManagerPanel';
 
 interface VoiceStudioPageProps {
   project: Project;
@@ -88,6 +91,7 @@ export function VoiceStudioPage({
   const saveTimerRef = useRef<number | null>(null);
 
   const [fishConfigured, setFishConfigured] = useState<boolean | null>(null);
+  const [geminiConfigured, setGeminiConfigured] = useState<boolean | null>(null);
   const [sourceLanguage, setSourceLanguage] = useState<string>(
     project.translation.sourceLanguage || 'Auto'
   );
@@ -121,6 +125,7 @@ export function VoiceStudioPage({
   const [busyTranslate, setBusyTranslate] = useState(false);
   const [busyPreview, setBusyPreview] = useState(false);
   const [busyGenerate, setBusyGenerate] = useState(false);
+  const [busyAutoDub, setBusyAutoDub] = useState(false);
   const [busyRegenSegments, setBusyRegenSegments] = useState(false);
   const [busyMusic, setBusyMusic] = useState(false);
   const [focusAudioOverflowSignal, setFocusAudioOverflowSignal] = useState(0);
@@ -135,8 +140,14 @@ export function VoiceStudioPage({
   useEffect(() => {
     void api
       .getSystemStatus()
-      .then((s) => setFishConfigured(s.fishConfigured))
-      .catch(() => setFishConfigured(null));
+      .then((s) => {
+        setFishConfigured(s.fishConfigured);
+        setGeminiConfigured(s.geminiConfigured);
+      })
+      .catch(() => {
+        setFishConfigured(null);
+        setGeminiConfigured(null);
+      });
     void api
       .listSavedFishVoices()
       .then(({ voices: sv }) => setSavedVoices(sv))
@@ -431,7 +442,7 @@ export function VoiceStudioPage({
     }
   };
 
-  const handleGenerateDub = async () => {
+  const handleGenerateDub = async (skipExistingValid = false) => {
     setErrorMsg(null);
     setStatusMsg(null);
     setBusyGenerate(true);
@@ -441,12 +452,97 @@ export function VoiceStudioPage({
         voice: { ...voice, targetLanguage, provider: 'fish', speakingSpeed: 1.0, enabled: true },
         captions: project.captions,
         useTranslated: hasTranslations,
+        skipExistingValid,
       });
       setActiveDubJob(res.job);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyGenerate(false);
+    }
+  };
+
+  const handleRunAutoDub = async () => {
+    if (!project.sourceVideoUrl) {
+      setErrorMsg('Upload a source video in Stage 1 before running Auto Dub.');
+      return;
+    }
+    setErrorMsg(null);
+    setStatusMsg(null);
+    setBusyAutoDub(true);
+    try {
+      let currentProject = project;
+
+      // Step 1: Transcribe audio & sync speakers if no captions exist yet
+      if (currentProject.captions.length === 0) {
+        setStatusMsg('Auto Dub Step 1/3: Extracting 16kHz audio and transcribing via Fish Audio ASR...');
+        const asrRes = await api.transcribeWithFish(currentProject.id, sourceLanguage);
+        currentProject = asrRes.project;
+        onProjectUpdated(currentProject);
+        setSourceLanguage(asrRes.detectedLanguage);
+      }
+
+      if (currentProject.captions.length === 0) {
+        throw new Error('No spoken dialogue segments were detected in the video.');
+      }
+
+      // Step 2: Translate if target translations are missing
+      const needsTranslation = currentProject.captions.some(
+        (c) => !c.translatedText || !c.translatedText.trim()
+      );
+      if (needsTranslation) {
+        if (geminiConfigured) {
+          setStatusMsg(
+            `Auto Dub Step 2/3: Translating ${currentProject.captions.length} segments to ${targetLanguage} via Gemini API...`
+          );
+          await api.updateProject(currentProject.id, {
+            captions: currentProject.captions,
+            translation: {
+              ...currentProject.translation,
+              sourceLanguage,
+              targetLanguage,
+              preserveProperNouns,
+            },
+            voice: { ...currentProject.voice, targetLanguage, provider: 'fish' },
+          });
+          const trRes = await api.translate(
+            currentProject.id,
+            targetLanguage,
+            preserveProperNouns
+          );
+          currentProject = trRes.project;
+          onProjectUpdated(currentProject);
+        } else {
+          setTranslationMode('external-gemini');
+          setStatusMsg(
+            `Extracted ${currentProject.captions.length} transcript segments & speaker labels. Because no Gemini API key is saved in Settings, use the free External Gemini tab below (Copy Prompt -> Paste JSON) or add a Gemini key in Settings, then click "Run Auto Dub" or "Generate Voice".`
+          );
+          setBusyAutoDub(false);
+          return;
+        }
+      }
+
+      // Step 3: Synthesize multi-speaker Fish Audio dub (reusing valid existing clips)
+      setStatusMsg(
+        `Auto Dub Step 3/3: Synthesizing ${currentProject.captions.length} multi-speaker Fish Audio clips & syncing timeline...`
+      );
+      const dubRes = await api.generateFishDub(currentProject.id, {
+        voice: {
+          ...currentProject.voice,
+          targetLanguage,
+          provider: 'fish',
+          speakingSpeed: 1.0,
+          enabled: true,
+        },
+        captions: currentProject.captions,
+        useTranslated: true,
+        skipExistingValid: true,
+      });
+      setActiveDubJob(dubRes.job);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAutoDub(false);
     }
   };
 
@@ -661,7 +757,7 @@ export function VoiceStudioPage({
                 Synchronization &amp; Audio Mixing
               </h2>
               <span className="text-[11px] font-mono text-zinc-400">
-                FFmpeg Timeline Mix
+                Web Audio Timeline Mix
               </span>
             </div>
 
@@ -849,8 +945,83 @@ export function VoiceStudioPage({
           </div>
         </div>
 
-        {/* RIGHT COLUMN: Transcription, Translation, Fish Voice Selection & Segment Editor */}
+        {/* RIGHT COLUMN: Auto Dub Pipeline, Transcription, Translation, Multi-Speaker Voices & Segment Editor */}
         <div className="xl:col-span-6 space-y-4">
+          {/* One-Click Auto Dub Pipeline Card */}
+          <div className="p-4 rounded-xl bg-gradient-to-br from-[#161422] to-[#111115] border border-violet-500/30 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-display font-semibold text-white flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-violet-400" />
+                  Auto Dub Pipeline (End-to-End)
+                </h2>
+                <p className="text-[11px] text-zinc-400 mt-0.5">
+                  Transcribe audio → detect speakers → translate → synthesize multi-speaker Fish Audio → sync timeline.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleRunAutoDub()}
+                disabled={
+                  !project.sourceVideoUrl ||
+                  busyAutoDub ||
+                  isDubGenerating ||
+                  busyTranscribe ||
+                  busyTranslate
+                }
+                className="px-3.5 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-xs font-semibold text-white flex items-center gap-2 whitespace-nowrap cursor-pointer shadow-sm"
+              >
+                {busyAutoDub ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Zap className="w-3.5 h-3.5" />
+                )}
+                {busyAutoDub ? 'Running Auto Dub...' : 'Run Auto Dub'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono">
+              <div
+                className={`px-2 py-1.5 rounded border ${
+                  project.captions.length > 0
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-zinc-900 border-white/[0.06] text-zinc-400'
+                }`}
+              >
+                1. ASR: {project.captions.length} lines
+              </div>
+              <div
+                className={`px-2 py-1.5 rounded border ${
+                  (project.speakers?.length || 0) > 0
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-zinc-900 border-white/[0.06] text-zinc-400'
+                }`}
+              >
+                2. Speakers: {project.speakers?.length || 0}
+              </div>
+              <div
+                className={`px-2 py-1.5 rounded border ${
+                  project.captions.some((c) => Boolean(c.translatedText?.trim()))
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-zinc-900 border-white/[0.06] text-zinc-400'
+                }`}
+              >
+                3. Translated:{' '}
+                {project.captions.filter((c) => Boolean(c.translatedText?.trim())).length}/
+                {project.captions.length}
+              </div>
+              <div
+                className={`px-2 py-1.5 rounded border ${
+                  voice.fullDubUrl
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-zinc-900 border-white/[0.06] text-zinc-400'
+                }`}
+              >
+                4. Clips: {voice.generatedClips?.length || 0}/{project.captions.length}
+              </div>
+            </div>
+          </div>
+
           {/* Step 1 & 2: Source / Target Language + Transcribe + Translate */}
           <div className="p-4 rounded-xl bg-[#111115] border border-white/[0.08] space-y-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1413,8 +1584,21 @@ export function VoiceStudioPage({
                 Audio Preview
               </button>
 
+              {voice.generatedClips.length > 0 &&
+                voice.generatedClips.length < project.captions.length && (
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateDub(true)}
+                    disabled={isDubGenerating || project.captions.length === 0}
+                    className="px-3.5 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-xs font-semibold text-white flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Resume Missing ({project.captions.length - voice.generatedClips.length})
+                  </button>
+                )}
+
               <button
-                onClick={handleGenerateDub}
+                onClick={() => void handleGenerateDub(false)}
                 disabled={isDubGenerating || project.captions.length === 0}
                 className="flex-1 py-2.5 px-4 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-xs font-semibold text-white flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
               >
@@ -1540,6 +1724,16 @@ export function VoiceStudioPage({
             )}
           </div>
 
+          {/* Multi-Speaker Management & Voice Assignment */}
+          <SpeakersManagerPanel
+            project={project}
+            savedVoices={savedVoices}
+            fetchedVoices={voices}
+            onProjectUpdated={onProjectUpdated}
+            onStatusMessage={(m) => setStatusMsg(m || null)}
+            onErrorMessage={(m) => setErrorMsg(m || null)}
+          />
+
           {/* Step 4: Interactive Transcript & Translation Segment Editor */}
           <div className="p-4 rounded-xl bg-[#111115] border border-white/[0.08] space-y-3">
             <div className="flex items-center justify-between">
@@ -1604,11 +1798,29 @@ export function VoiceStudioPage({
                             #{idx + 1} · {formatTimecode(seg.start)}
                           </button>
 
-                          {seg.speaker && (
-                            <span className="text-[11px] font-medium text-zinc-300">
-                              {seg.speaker}
-                            </span>
-                          )}
+                          <select
+                            value={seg.speaker || ''}
+                            onChange={(e) =>
+                              updateSegment(seg.id, {
+                                speaker: e.target.value ? e.target.value : undefined,
+                              })
+                            }
+                            aria-label={`Speaker for segment ${idx + 1}`}
+                            className="bg-zinc-900 border border-white/[0.08] rounded px-1.5 py-0.5 text-[11px] text-zinc-200 max-w-[140px]"
+                          >
+                            <option value="">Default Voice</option>
+                            {(project.speakers || []).map((sp) => (
+                              <option key={sp.id} value={sp.name}>
+                                {sp.name}
+                              </option>
+                            ))}
+                            {seg.speaker &&
+                              !(project.speakers || []).some(
+                                (sp) =>
+                                  normalizeSpeakerName(sp.name).toLowerCase() ===
+                                  normalizeSpeakerName(seg.speaker).toLowerCase()
+                              ) && <option value={seg.speaker}>{seg.speaker}</option>}
+                          </select>
 
                           {segSync && segSync.adjustmentType === 'gap-expanded' && (
                             <span
@@ -1677,6 +1889,16 @@ export function VoiceStudioPage({
                             aria-label="Segment end seconds"
                             className="w-16 bg-zinc-900 border border-white/[0.08] rounded px-1.5 py-0.5 text-[11px] font-mono text-zinc-200"
                           />
+                          <button
+                            type="button"
+                            onClick={() => void handleRegenerateSelectedSegments([seg.id])}
+                            disabled={busyRegenSegments || isDubGenerating}
+                            className="p-1 text-zinc-400 hover:text-violet-300 disabled:opacity-40 cursor-pointer"
+                            title="Regenerate Fish Audio clip for this segment"
+                            aria-label="Regenerate segment audio"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${busyRegenSegments ? 'animate-spin' : ''}`} />
+                          </button>
                           <button
                             onClick={() => removeSegment(seg.id)}
                             className="p-1 text-zinc-500 hover:text-red-400 cursor-pointer"

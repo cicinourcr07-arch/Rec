@@ -19,6 +19,7 @@ import {
   normalizeSyncMode,
 } from '../../server/services/timeline_sync_service';
 import { getPersonalFishApiKey } from './fishKeyStore';
+import { resolveSpeakerVoice } from './speakers';
 
 function getAudioContextCtor(): typeof AudioContext | null {
   if (typeof window === 'undefined') return null;
@@ -184,16 +185,34 @@ export async function fetchFishAudioFromEndpoint(params: {
   if (!res.ok) {
     let msg = `Fish Audio request failed (${res.status})`;
     const textBody = await res.text().catch(() => '');
-    try {
-      const parsed = JSON.parse(textBody) as { error?: string };
-      if (parsed?.error) msg = parsed.error;
-    } catch {
-      if (textBody.trim()) msg = textBody.trim();
+    const looksHtml =
+      /^<!doctype/i.test(textBody.trim()) ||
+      /^<html/i.test(textBody.trim()) ||
+      /<\/html>/i.test(textBody);
+    if (!looksHtml) {
+      try {
+        const parsed = JSON.parse(textBody) as { error?: string; message?: string };
+        if (parsed?.error) msg = parsed.error;
+        else if (parsed?.message) msg = parsed.message;
+      } catch {
+        if (textBody.trim()) msg = textBody.trim().slice(0, 240);
+      }
+    } else if (res.status === 404 || res.status === 405) {
+      msg = `Fish Audio endpoint /api/fish-audio is unavailable (HTTP ${res.status}). Deploy with Cloudflare Pages Functions enabled.`;
+    } else {
+      msg = `Unexpected HTML error response from Fish Audio endpoint (HTTP ${res.status}).`;
     }
     if (resolvedKey && resolvedKey.length >= 4) {
       msg = msg.split(resolvedKey).join('[redacted]');
     }
     throw new Error(msg);
+  }
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (contentType.includes('text/html')) {
+    throw new Error(
+      'Unexpected HTML response from /api/fish-audio instead of an audio stream. Ensure Cloudflare Pages Functions are deployed.'
+    );
   }
 
   const blob = await res.blob();
@@ -254,6 +273,8 @@ export async function generateEdgeFishDubbing(params: {
   fishEndpointUrl: string;
   apiKey?: string | null;
   targetSegmentIds?: Set<string>;
+  skipExistingValid?: boolean;
+  onClipGenerated?: (clipsSoFar: GeneratedVoiceClip[], latestClip: GeneratedVoiceClip) => Promise<void> | void;
   onProgress?: (progress: number, stage: string, etaSeconds: number | null) => void;
 }): Promise<{
   clips: GeneratedVoiceClip[];
@@ -269,6 +290,8 @@ export async function generateEdgeFishDubbing(params: {
     fishEndpointUrl,
     apiKey,
     targetSegmentIds,
+    skipExistingValid,
+    onClipGenerated,
     onProgress,
   } = params;
 
@@ -278,7 +301,6 @@ export async function generateEdgeFishDubbing(params: {
   const existingClipsById = new Map(
     (voiceConfig.generatedClips || []).map((c) => [c.segmentId, c])
   );
-  const lockedRef = voiceConfig.fishReferenceId?.trim() || undefined;
   const workItems = captions
     .map((seg, index) => {
       const spokenText = (
@@ -298,9 +320,21 @@ export async function generateEdgeFishDubbing(params: {
 
   for (let i = 0; i < workItems.length; i++) {
     const { seg, index, spokenText } = workItems[i];
+    const speakerVoice = resolveSpeakerVoice(seg, project, voiceConfig);
+    const targetVoiceIdUsed = speakerVoice.referenceId || 'default';
     const existing = existingClipsById.get(seg.id);
-    const shouldGenerate =
-      !targetSegmentIds || targetSegmentIds.has(seg.id) || !existing || !isLocalMediaUri(existing.audioUrl);
+
+    const existingMatches =
+      existing &&
+      isLocalMediaUri(existing.audioUrl) &&
+      existing.text.trim() === spokenText &&
+      (!existing.voiceIdUsed || existing.voiceIdUsed === targetVoiceIdUsed);
+
+    const shouldGenerate = targetSegmentIds
+      ? targetSegmentIds.has(seg.id) || !existing || !isLocalMediaUri(existing.audioUrl)
+      : skipExistingValid
+      ? !existingMatches
+      : true;
 
     if (!shouldGenerate && existing && (await getMediaBlob(existing.audioUrl))) {
       const slotDur = Math.max(0.2, seg.end - seg.start);
@@ -316,23 +350,26 @@ export async function generateEdgeFishDubbing(params: {
         overflowSeconds: overflowSec,
         text: spokenText,
         speaker: seg.speaker,
+        voiceIdUsed: existing.voiceIdUsed || targetVoiceIdUsed,
       });
       continue;
     }
 
     const ratio = i / workItems.length;
     const elapsedSec = (Date.now() - startedAt) / 1000;
-    const eta = i >= 2 && ratio > 0 ? Math.max(1, Math.round((elapsedSec / ratio) * (1 - ratio) + 2)) : null;
+    const eta =
+      i >= 2 && ratio > 0 ? Math.max(1, Math.round((elapsedSec / ratio) * (1 - ratio) + 2)) : null;
+    const speakerLabel = speakerVoice.speakerName ? ` [${speakerVoice.speakerName}]` : '';
     onProgress?.(
       Math.min(86, Math.round(6 + ratio * 80)),
-      `Synthesizing segment ${i + 1}/${workItems.length} via /api/fish-audio...`,
+      `Synthesizing segment ${i + 1}/${workItems.length}${speakerLabel} via /api/fish-audio...`,
       eta
     );
 
     const mp3Blob = await fetchFishAudioFromEndpoint({
       endpointUrl: fishEndpointUrl,
       text: spokenText,
-      referenceId: lockedRef,
+      referenceId: speakerVoice.referenceId,
       format: 'mp3',
       apiKey: resolvedKey,
     });
@@ -352,7 +389,7 @@ export async function generateEdgeFishDubbing(params: {
         ? Math.round((analyzed.duration - slotDur) * 100) / 100
         : 0;
 
-    rawClips.push({
+    const builtClip: GeneratedVoiceClip = {
       segmentId: seg.id,
       audioUrl: savedClip.uri,
       start: seg.start,
@@ -367,7 +404,18 @@ export async function generateEdgeFishDubbing(params: {
       overflowSeconds: overflowSec,
       text: spokenText,
       speaker: seg.speaker,
-    });
+      voiceIdUsed: targetVoiceIdUsed,
+    };
+
+    rawClips.push(builtClip);
+
+    if (onClipGenerated) {
+      // Merge newly generated clips with any untouched remaining existing clips so partial progress stays complete
+      const remainingExisting = (voiceConfig.generatedClips || []).filter(
+        (c) => !rawClips.some((r) => r.segmentId === c.segmentId)
+      );
+      await onClipGenerated([...rawClips, ...remainingExisting], builtClip);
+    }
 
     if (targetSegmentIds?.has(seg.id)) {
       regeneratedIds.push(seg.id);

@@ -37,8 +37,9 @@
 - **Frontend**: `src/` (React 19, TypeScript, Tailwind CSS v4, Lucide Icons) — handles all video selection, preview, frame extraction, audio extraction, subtitles, and rendering locally in the browser via File API, Canvas, Web Audio, MediaRecorder, and IndexedDB.
 - **Personal Fish Audio API Key Storage**: `src/lib/fishKeyStore.ts` stores the user's personal Fish Audio API key locally inside browser IndexedDB (`recap_studio_personal_keys_v1`) when **Remember API Key on this device** is enabled, or in memory for the current session only. It is never uploaded to any database, exported in project backups, logged, or committed to GitHub.
 - **Cloudflare Pages Functions**:
-  - `functions/api/fish-audio.js`: Accepts `POST /api/fish-audio` requests only over HTTPS from the same origin, reads the user's personal key from the `Authorization: Bearer <token>` header, supports real connection verification (`{ action: "test" }`), and forwards TTS requests to `https://api.fish.audio/v1/tts` without logging or persisting the key.
+  - `functions/api/fish-audio.js`: Accepts `POST /api/fish-audio` requests only over HTTPS from the same origin, reads the user's personal key from the `Authorization: Bearer <token>` header, supports real connection verification (`{ action: "test" }` against `POST https://api.fish.audio/v1/tts`), and forwards TTS requests to `https://api.fish.audio/v1/tts` without logging or persisting the key.
   - `functions/api/[[catchall]].ts`: Handles `/api/system/status`, `/api/fish/status`, `/api/fish/voices`, `/api/fish/asr`, `/api/projects/:id/dubbing/*`, and `/api/projects/:id/translate` directly on Cloudflare Pages Functions.
+  - `public/_routes.json`: Copied into `dist/_routes.json` during `npm run build` so Cloudflare Pages explicitly routes `/api/*`, `/media/*`, and `/storage/*` to Pages Functions instead of static asset handlers.
 - **Local Express Dev Server**: `server.ts` + `server/services/` (port `3000`)
 
 ## Configuration & Personal API Keys
@@ -53,11 +54,12 @@
 
 ### Deploying to Cloudflare Pages (GitHub Integration)
 
-1. Push this repository to GitHub (`.env` is excluded by `.gitignore`).
-2. In your **Cloudflare Pages** project, verify **Build & deployments**:
+1. Push the full repository (including `functions/api/fish-audio.js`, `functions/api/[[catchall]].ts`, and `public/_routes.json`) to your GitHub branch (`.env` is excluded by `.gitignore`).
+2. In **Cloudflare Pages → Settings → Build & deployments**:
+   - **Root directory**: leave blank / `/` (so Cloudflare detects `/functions` at the repository root)
    - **Build command**: `npm run build`
    - **Build output directory**: `dist`
-3. Cloudflare Pages automatically deploys `functions/api/fish-audio.js` as `/api/fish-audio` and serves `dist/` for the frontend. No `FISH_AUDIO_API_KEY` environment variable needs to be configured in Cloudflare for users to enter and use their own personal keys.
+3. Verify the Cloudflare Pages build log shows Functions compiled (`functions/api/fish-audio.js`) and `dist/_routes.json` exists in the build output. No `FISH_AUDIO_API_KEY` environment variable needs to be configured in Cloudflare for personal API keys.
 
 ## Running Locally
 

@@ -263,6 +263,7 @@ export async function renderProjectInBrowser(params: {
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
   let audioCtx: AudioContext | null = null;
+  let dubAudioEl: HTMLAudioElement | null = null;
   const auxAudios: HTMLAudioElement[] = [];
   const tracks: MediaStreamTrack[] = [];
 
@@ -304,6 +305,7 @@ export async function renderProjectInBrowser(params: {
       if (settings.applyDubbing && project.voice.enabled && project.voice.fullDubUrl && !project.voice.voiceMuted) {
         const dubAudio = await loadOptionalAudioElement(project.voice.fullDubUrl);
         if (dubAudio) {
+          dubAudioEl = dubAudio;
           auxAudios.push(dubAudio);
           const dubSrc = audioCtx.createMediaElementSource(dubAudio);
           const dubGain = audioCtx.createGain();
@@ -678,6 +680,21 @@ export async function renderProjectInBrowser(params: {
     }
   };
 
+  const timingOffsetSec = Number(project.voice.timingOffsetSec || 0);
+  const dubAudioDur =
+    dubAudioEl && Number.isFinite(dubAudioEl.duration) && dubAudioEl.duration > 0
+      ? dubAudioEl.duration
+      : 0;
+  const effectiveExportDuration = Math.max(
+    duration,
+    settings.applyDubbing && project.voice.enabled && project.voice.syncPlan?.estimatedFinalDuration
+      ? project.voice.syncPlan.estimatedFinalDuration
+      : 0,
+    settings.applyDubbing && project.voice.enabled && dubAudioDur > 0
+      ? Math.max(0, timingOffsetSec) + dubAudioDur
+      : 0
+  );
+
   video.currentTime = 0;
   recorder.start(300);
 
@@ -688,9 +705,21 @@ export async function renderProjectInBrowser(params: {
   // Start playback and frame loop
   const startWall = performance.now();
   await video.play();
+
+  let dubStartTimer: number | null = null;
   for (const a of auxAudios) {
-    a.currentTime = 0;
-    void a.play().catch(() => {});
+    if (a === dubAudioEl && timingOffsetSec > 0.02) {
+      a.currentTime = 0;
+      dubStartTimer = window.setTimeout(() => {
+        void a.play().catch(() => {});
+      }, Math.round(timingOffsetSec * 1000));
+    } else if (a === dubAudioEl && timingOffsetSec < -0.02) {
+      a.currentTime = Math.min(Math.max(0, dubAudioDur - 0.1), Math.abs(timingOffsetSec));
+      void a.play().catch(() => {});
+    } else {
+      a.currentTime = 0;
+      void a.play().catch(() => {});
+    }
   }
 
   let finished = false;
@@ -703,24 +732,35 @@ export async function renderProjectInBrowser(params: {
       resolve();
     };
 
-    video.onended = finishPlayback;
+    video.onended = () => {
+      const elapsedSec = (performance.now() - startWall) / 1000;
+      if (elapsedSec >= effectiveExportDuration - 0.08) {
+        finishPlayback();
+      }
+    };
 
     const tick = () => {
       if (finished) return;
       drawFrame();
 
-      const cur = video.currentTime || 0;
+      const elapsedSec = (performance.now() - startWall) / 1000;
+      const cur = video.ended ? Math.min(effectiveExportDuration, elapsedSec) : video.currentTime || 0;
       const now = performance.now();
       if (now - lastProgressAt > 250) {
         lastProgressAt = now;
-        const frac = Math.min(0.99, cur / Math.max(0.1, duration));
+        const frac = Math.min(0.99, Math.max(cur, elapsedSec) / Math.max(0.1, effectiveExportDuration));
         const pct = Math.min(95, Math.max(8, Math.round(8 + frac * 86)));
-        const elapsedSec = (now - startWall) / 1000;
-        const eta = frac > 0.05 ? Math.max(1, Math.round((elapsedSec / frac) * (1 - frac))) : Math.ceil(duration);
+        const eta =
+          frac > 0.05
+            ? Math.max(1, Math.round((elapsedSec / frac) * (1 - frac)))
+            : Math.ceil(effectiveExportDuration);
         onProgress(pct, `Rendering edited frames in browser (${Math.round(frac * 100)}%)...`, eta);
       }
 
-      if (video.ended || cur >= duration - 0.02) {
+      if (
+        (video.ended || (video.currentTime || 0) >= duration - 0.02) &&
+        elapsedSec >= effectiveExportDuration - 0.02
+      ) {
         drawFrame();
         finishPlayback();
         return;
@@ -731,6 +771,10 @@ export async function renderProjectInBrowser(params: {
 
     window.requestAnimationFrame(tick);
   });
+
+  if (dubStartTimer !== null) {
+    window.clearTimeout(dubStartTimer);
+  }
 
   onProgress(97, 'Finalizing exported video file in browser storage...', 1);
   if (recorder.state !== 'inactive') {

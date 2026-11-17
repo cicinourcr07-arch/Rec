@@ -60,6 +60,7 @@ export function buildDefaultProject(name: string): Project {
       preserveProperNouns: true,
     },
     voice: { ...DEFAULT_VOICE_CONFIG },
+    speakers: [],
     blurs: [],
     logos: [],
     videoEffects: { ...DEFAULT_VIDEO_EFFECTS },

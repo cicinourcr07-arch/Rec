@@ -28,6 +28,12 @@ import {
   loadPersonalFishKeyState,
   savePersonalFishApiKey,
 } from '../lib/fishKeyStore';
+import {
+  deletePersonalGeminiApiKey,
+  GeminiConnectionStatus,
+  loadPersonalGeminiKeyState,
+  savePersonalGeminiApiKey,
+} from '../lib/geminiKeyStore';
 import { formatBytes } from '../lib/formatters';
 
 interface SettingsPageProps {
@@ -84,6 +90,23 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
   const [testingFishKey, setTestingFishKey] = useState(false);
   const [deletingFishKey, setDeletingFishKey] = useState(false);
 
+  // Personal Gemini API Key state (optional, stored locally in IndexedDB only)
+  const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
+  const [rememberGeminiOnDevice, setRememberGeminiOnDevice] = useState(true);
+  const [hasSavedGeminiKey, setHasSavedGeminiKey] = useState(false);
+  const [geminiKeyUpdatedAt, setGeminiKeyUpdatedAt] = useState<string | null>(null);
+  const [geminiStorageError, setGeminiStorageError] = useState<string | null>(null);
+  const [geminiConnectionStatus, setGeminiConnectionStatus] =
+    useState<GeminiConnectionStatus>('not_configured');
+  const [geminiFeedback, setGeminiFeedback] = useState<{
+    type: 'success' | 'error' | 'info';
+    text: string;
+  } | null>(null);
+  const [savingGeminiKey, setSavingGeminiKey] = useState(false);
+  const [testingGeminiKey, setTestingGeminiKey] = useState(false);
+  const [deletingGeminiKey, setDeletingGeminiKey] = useState(false);
+
   const refreshSystemStatus = () => {
     void api.getSystemStatus().then(setStatus).catch(() => {});
   };
@@ -123,6 +146,28 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
       }
     });
 
+    void loadPersonalGeminiKeyState().then(async (state) => {
+      if (!active) return;
+      if (state.storageError) {
+        setGeminiStorageError(state.storageError);
+      }
+      if (state.apiKey) {
+        setGeminiKeyInput(state.apiKey);
+        setHasSavedGeminiKey(true);
+        setRememberGeminiOnDevice(state.rememberOnDevice);
+        setGeminiKeyUpdatedAt(state.updatedAt);
+        setTestingGeminiKey(true);
+        const testRes = await api.testGeminiConnection(state.apiKey);
+        if (!active) return;
+        setGeminiConnectionStatus(testRes.status);
+        setTestingGeminiKey(false);
+      } else {
+        setHasSavedGeminiKey(false);
+        setRememberGeminiOnDevice(state.indexedDbAvailable);
+        setGeminiConnectionStatus('not_configured');
+      }
+    });
+
     return () => {
       active = false;
     };
@@ -150,7 +195,7 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
       refreshSystemStatus();
 
       setTestingFishKey(true);
-      const testRes = await api.testFishConnection(fishKeyInput);
+      const testRes = await api.testFishConnection();
       setFishConnectionStatus(testRes.status);
       setTestingFishKey(false);
 
@@ -197,7 +242,10 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
 
     setTestingFishKey(true);
     try {
-      const res = await api.testFishConnection(keyToTest);
+      const stored = await loadPersonalFishKeyState();
+      const res = await api.testFishConnection(
+        stored.apiKey && stored.apiKey === keyToTest ? undefined : keyToTest
+      );
       setFishConnectionStatus(res.status);
       setFishFeedback({
         type: res.ok ? 'success' : 'error',
@@ -236,6 +284,107 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
     }
   };
 
+  const handleSaveGeminiKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setGeminiFeedback(null);
+    setGeminiStorageError(null);
+
+    if (rememberGeminiOnDevice && !indexedDbAvailable) {
+      setGeminiFeedback({
+        type: 'error',
+        text: 'IndexedDB is unavailable in this browser. Uncheck "Remember API Key on this device" to keep the key only for this session.',
+      });
+      return;
+    }
+
+    setSavingGeminiKey(true);
+    try {
+      const saved = await savePersonalGeminiApiKey(geminiKeyInput, rememberGeminiOnDevice);
+      setHasSavedGeminiKey(true);
+      setRememberGeminiOnDevice(saved.rememberOnDevice);
+      setGeminiKeyUpdatedAt(saved.updatedAt);
+      refreshSystemStatus();
+
+      setTestingGeminiKey(true);
+      const testRes = await api.testGeminiConnection();
+      setGeminiConnectionStatus(testRes.status);
+      setTestingGeminiKey(false);
+
+      const storageLocation = saved.rememberOnDevice
+        ? 'saved locally in IndexedDB on this device'
+        : 'kept in memory for this browser session only';
+
+      setGeminiFeedback({
+        type: testRes.ok ? 'success' : testRes.status === 'invalid_key' ? 'error' : 'info',
+        text: testRes.ok
+          ? `Gemini API key ${storageLocation} and verified (${testRes.message}).`
+          : `Gemini API key ${storageLocation}, but connection test reported: ${testRes.message}`,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to save Gemini API key.';
+      setGeminiFeedback({ type: 'error', text: msg });
+      if (msg.toLowerCase().includes('indexeddb')) {
+        setGeminiStorageError(msg);
+      }
+    } finally {
+      setSavingGeminiKey(false);
+      setTestingGeminiKey(false);
+    }
+  };
+
+  const handleTestGeminiConnection = async () => {
+    setGeminiFeedback(null);
+    const keyToTest = geminiKeyInput.trim();
+    if (!keyToTest) {
+      setGeminiConnectionStatus('not_configured');
+      setGeminiFeedback({
+        type: 'error',
+        text: 'Enter your Gemini API key before testing, or use External Gemini (No Key) mode for free.',
+      });
+      return;
+    }
+
+    setTestingGeminiKey(true);
+    try {
+      const stored = await loadPersonalGeminiKeyState();
+      const res = await api.testGeminiConnection(
+        stored.apiKey && stored.apiKey === keyToTest ? undefined : keyToTest
+      );
+      setGeminiConnectionStatus(res.status);
+      setGeminiFeedback({
+        type: res.ok ? 'success' : 'error',
+        text: res.message,
+      });
+    } finally {
+      setTestingGeminiKey(false);
+    }
+  };
+
+  const handleDeleteGeminiKey = async () => {
+    setGeminiFeedback(null);
+    setDeletingGeminiKey(true);
+    try {
+      await deletePersonalGeminiApiKey();
+      setGeminiKeyInput('');
+      setShowGeminiKey(false);
+      setHasSavedGeminiKey(false);
+      setGeminiKeyUpdatedAt(null);
+      setGeminiConnectionStatus('not_configured');
+      refreshSystemStatus();
+      setGeminiFeedback({
+        type: 'info',
+        text: 'Personal Gemini API key removed from this device. External Gemini (No Key) mode remains ready.',
+      });
+    } catch (err) {
+      setGeminiFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to delete saved Gemini API key.',
+      });
+    } finally {
+      setDeletingGeminiKey(false);
+    }
+  };
+
   const handleCleanup = async () => {
     setCleaning(true);
     setCleanupMsg(null);
@@ -264,6 +413,7 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
     MediaRecorder.isTypeSupported('video/webm');
   const hasWebCodecs = typeof (window as unknown as { VideoDecoder?: unknown }).VideoDecoder !== 'undefined';
   const connUi = CONNECTION_STATUS_UI[fishConnectionStatus];
+  const geminiConnUi = CONNECTION_STATUS_UI[geminiConnectionStatus];
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
@@ -445,6 +595,172 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
         <div className="p-3 rounded-lg bg-[#09090B] border border-white/[0.06] text-[11px] text-zinc-400 leading-relaxed">
           <strong className="text-zinc-200">Device-Local Security Notice:</strong> Your key is stored only in this browser&apos;s IndexedDB (never uploaded, backed up in project ZIPs, or committed to GitHub) and sent only over HTTPS via the <code className="text-zinc-300">Authorization</code> header to <code className="text-zinc-300">/api/fish-audio</code> when generating audio. Because browser-local storage is accessible to scripts executing in the same origin, only save keys on trusted devices and delete them on shared computers.
         </div>
+      </section>
+
+      {/* Personal Gemini API Settings (Optional Automatic Translation) */}
+      <section
+        aria-label="Gemini API Settings"
+        className="p-5 rounded-xl bg-[#111115] border border-white/[0.08] space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <KeyRound className="w-4 h-4 text-sky-400" />
+            <h2 className="text-sm font-display font-semibold text-white">
+              Gemini API Settings (Optional Automatic Translation)
+            </h2>
+          </div>
+
+          <span
+            data-testid="gemini-connection-status"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-medium ${geminiConnUi.badgeClass}`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${geminiConnUi.dotClass}`} />
+            {testingGeminiKey ? 'Testing Connection...' : geminiConnUi.label}
+          </span>
+        </div>
+
+        <p className="text-xs text-zinc-400 leading-relaxed">
+          Optional: Save your personal Gemini API key locally in IndexedDB to run one-click automatic script translation inside Auto Dub via{' '}
+          <code className="text-zinc-200">POST /api/projects/:id/translate</code>. Without a key,{' '}
+          <strong className="text-zinc-200">External Gemini (No Key)</strong> and manual SRT/VTT import remain 100% free and active.
+        </p>
+
+        {geminiStorageError && (
+          <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 flex items-start gap-2">
+            <WifiOff className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">Local Persistent Storage Unavailable: </span>
+              <span>{geminiStorageError}</span>
+            </div>
+          </div>
+        )}
+
+        <form onSubmit={handleSaveGeminiKey} className="space-y-3.5">
+          <div className="space-y-1.5">
+            <label
+              htmlFor="personal-gemini-api-key"
+              className="block text-xs font-medium text-zinc-200"
+            >
+              Personal Gemini API Key (Optional)
+            </label>
+            <div className="relative flex-1">
+              <input
+                id="personal-gemini-api-key"
+                type={showGeminiKey ? 'text' : 'password'}
+                value={geminiKeyInput}
+                onChange={(e) => setGeminiKeyInput(e.target.value)}
+                placeholder="Paste your Gemini API key (optional)..."
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full bg-[#18181D] border border-white/[0.08] focus:border-sky-500/60 focus:outline-none rounded-lg pl-3 pr-24 py-2 text-xs font-mono text-zinc-100 placeholder:text-zinc-500"
+              />
+              <button
+                type="button"
+                onClick={() => setShowGeminiKey((prev) => !prev)}
+                aria-label={showGeminiKey ? 'Hide Gemini API Key' : 'Show Gemini API Key'}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-1 rounded bg-zinc-800/90 hover:bg-zinc-700 text-[11px] font-medium text-zinc-200 flex items-center gap-1 cursor-pointer"
+              >
+                {showGeminiKey ? (
+                  <>
+                    <EyeOff className="w-3.5 h-3.5 text-zinc-300" />
+                    Hide
+                  </>
+                ) : (
+                  <>
+                    <Eye className="w-3.5 h-3.5 text-zinc-300" />
+                    Show
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={rememberGeminiOnDevice}
+                onChange={(e) => setRememberGeminiOnDevice(e.target.checked)}
+                className="accent-sky-500"
+              />
+              <span>Remember API Key on this device</span>
+            </label>
+
+            {hasSavedGeminiKey && geminiKeyUpdatedAt && (
+              <span className="text-[11px] font-mono text-zinc-500">
+                Saved {rememberGeminiOnDevice ? 'in IndexedDB' : 'for session'} ·{' '}
+                {new Date(geminiKeyUpdatedAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 pt-1">
+            <button
+              type="submit"
+              disabled={savingGeminiKey || !geminiKeyInput.trim()}
+              className="px-3.5 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
+            >
+              {savingGeminiKey ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Save className="w-3.5 h-3.5" />
+              )}
+              Save Gemini Key
+            </button>
+
+            <button
+              type="button"
+              onClick={handleTestGeminiConnection}
+              disabled={testingGeminiKey || !geminiKeyInput.trim()}
+              className="px-3.5 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-xs font-medium text-zinc-100 flex items-center gap-1.5 cursor-pointer"
+            >
+              {testingGeminiKey ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <PlugZap className="w-3.5 h-3.5 text-sky-400" />
+              )}
+              Test Connection
+            </button>
+
+            <button
+              type="button"
+              onClick={handleDeleteGeminiKey}
+              disabled={deletingGeminiKey || (!hasSavedGeminiKey && !geminiKeyInput)}
+              className="px-3.5 py-2 rounded-lg bg-zinc-900 hover:bg-red-950/50 border border-white/[0.08] hover:border-red-500/35 disabled:opacity-40 text-xs font-medium text-zinc-300 hover:text-red-300 flex items-center gap-1.5 cursor-pointer"
+            >
+              {deletingGeminiKey ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="w-3.5 h-3.5" />
+              )}
+              Delete Gemini Key
+            </button>
+          </div>
+        </form>
+
+        {geminiFeedback && (
+          <div
+            role="status"
+            className={`p-3 rounded-lg border text-xs flex items-start gap-2 ${
+              geminiFeedback.type === 'success'
+                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                : geminiFeedback.type === 'error'
+                ? 'bg-red-500/10 border-red-500/30 text-red-200'
+                : 'bg-zinc-900 border-white/[0.08] text-zinc-300'
+            }`}
+          >
+            {geminiFeedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+            ) : (
+              <AlertCircle
+                className={`w-4 h-4 shrink-0 mt-0.5 ${
+                  geminiFeedback.type === 'error' ? 'text-red-400' : 'text-zinc-400'
+                }`}
+              />
+            )}
+            <span>{geminiFeedback.text}</span>
+          </div>
+        )}
       </section>
 
       {/* Browser Video Engine Readiness */}

@@ -28,6 +28,7 @@ import {
   SupportedLanguage,
 } from '../types/studio';
 import { api } from '../lib/api';
+import { syncSpeakersFromCaptions } from '../lib/speakers';
 import { createWorkflowUpdate } from '../lib/workflowStages';
 import {
   DEFAULT_NARRATION_VALIDATION_CONFIG,
@@ -486,6 +487,7 @@ export function ExternalGeminiTranslatorPanel({
       // Persist updated segments + full JSON draft + correction history to DB (keeping subtitleStyle.enabled untouched!)
       const { project: saved } = await api.updateProject(project.id, {
         captions: patchResult.updatedSegments,
+        speakers: syncSpeakersFromCaptions(project.speakers, patchResult.updatedSegments),
         translation: {
           ...project.translation,
           sourceLanguage:
@@ -633,6 +635,7 @@ export function ExternalGeminiTranslatorPanel({
       });
       const { project: saved } = await api.updateProject(project.id, {
         captions: result.normalizedSegments,
+        speakers: syncSpeakersFromCaptions(project.speakers, result.normalizedSegments),
         translation: {
           ...project.translation,
           sourceLanguage: detectedSrc,

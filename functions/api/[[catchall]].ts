@@ -1,11 +1,11 @@
 /**
- * Self-contained Cloudflare Pages Function fallback for /api/* routes
+ * Self-contained Cloudflare Pages Function handler for /api/* routes
  * (e.g. /api/system/status, /api/fish/status, /api/fish/voices, /api/fish/asr,
- * /api/projects/:id/dubbing/*, /api/projects/:id/translate, /api/health).
+ * /api/gemini/test, /api/projects/:id/dubbing/*, /api/projects/:id/translate, /api/health).
  *
- * Reads the user's personal Fish Audio API key from the Authorization Bearer
- * header first (stored locally in the user's browser IndexedDB), with optional
- * fallback to context.env.FISH_AUDIO_API_KEY. Never persists or logs keys.
+ * Reads personal API keys from request headers first (Authorization Bearer for Fish Audio,
+ * X-Gemini-Api-Key for Gemini — stored locally in the user's browser IndexedDB), with optional
+ * fallback to Cloudflare environment bindings. Never persists or logs keys, and never returns HTML.
  */
 
 interface PagesEnv {
@@ -42,7 +42,14 @@ function sanitizeMessage(msg: string, secretToRedact?: string): string {
   if (secretToRedact && secretToRedact.length >= 4) {
     clean = clean.split(secretToRedact).join('[redacted]');
   }
-  return clean.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
+  clean = clean.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
+  clean = clean.replace(/[?&]key=[^&\s"']+/gi, '?key=[redacted]');
+  return clean;
+}
+
+function isHtmlBody(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  return t.startsWith('<!doctype') || t.startsWith('<html') || t.includes('</html>');
 }
 
 function readBearerFromRequest(request: Request): string {
@@ -56,6 +63,14 @@ function readBearerFromRequest(request: Request): string {
   return token;
 }
 
+function readPersonalGeminiFromRequest(request: Request): string {
+  const headerVal = (request.headers.get('X-Gemini-Api-Key') || '').trim();
+  if (!headerVal || /[\r\n\s]/.test(headerVal) || PLACEHOLDER_KEYS.has(headerVal.toLowerCase())) {
+    return '';
+  }
+  return headerVal;
+}
+
 function readFishKey(request: Request, env: PagesEnv): string {
   const personal = readBearerFromRequest(request);
   if (personal) return personal;
@@ -64,7 +79,9 @@ function readFishKey(request: Request, env: PagesEnv): string {
   return raw;
 }
 
-function readGeminiKey(env: PagesEnv): string {
+function readGeminiKey(request: Request, env: PagesEnv): string {
+  const personal = readPersonalGeminiFromRequest(request);
+  if (personal) return personal;
   const raw = (env.GEMINI_API_KEY || '').trim();
   if (!raw || PLACEHOLDER_KEYS.has(raw.toLowerCase())) return '';
   return raw;
@@ -83,7 +100,9 @@ function validateSameOriginIfAuthenticated(
   request: Request,
   requestUrl: URL
 ): { ok: boolean; status: number; error: string } {
-  const hasAuth = Boolean(request.headers.get('Authorization'));
+  const hasAuth = Boolean(
+    request.headers.get('Authorization') || request.headers.get('X-Gemini-Api-Key')
+  );
   const forwardedProto = (request.headers.get('x-forwarded-proto') || '').toLowerCase();
   const isHttps = requestUrl.protocol === 'https:' || forwardedProto === 'https';
 
@@ -121,13 +140,16 @@ function validateSameOriginIfAuthenticated(
 
 function corsHeaders(request: Request): Record<string, string> {
   const requestOrigin = new URL(request.url).origin;
-  const hasAuth = Boolean(request.headers.get('Authorization'));
+  const hasAuth = Boolean(
+    request.headers.get('Authorization') || request.headers.get('X-Gemini-Api-Key')
+  );
   const origin = hasAuth ? requestOrigin : request.headers.get('Origin') || requestOrigin;
   return {
     Vary: 'Origin',
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
-    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range',
+    'Access-Control-Allow-Headers':
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Gemini-Api-Key, Range',
     'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Content-Disposition',
     'Access-Control-Max-Age': '86400',
   };
@@ -148,6 +170,9 @@ function parseFishError(rawText: string, status: number, secretToRedact?: string
   if (status === 401 || status === 403) {
     return 'Invalid Fish Audio API key or unauthorized access.';
   }
+  if (status === 402) {
+    return 'Fish Audio account balance or credits are insufficient.';
+  }
   if (status === 429) {
     return 'Fish Audio API rate limit exceeded. Please wait and try again.';
   }
@@ -156,11 +181,50 @@ function parseFishError(rawText: string, status: number, secretToRedact?: string
     const parsed = JSON.parse(rawText) as { message?: string; detail?: string; error?: string };
     msg = parsed.message || parsed.detail || parsed.error || msg;
   } catch {
-    if (rawText.trim()) {
-      msg = `${msg}: ${rawText.trim().slice(0, 220)}`;
+    const trimmed = (rawText || '').trim();
+    if (trimmed && !isHtmlBody(trimmed) && status < 500) {
+      msg = `${msg}: ${trimmed.slice(0, 220)}`;
     }
   }
   return sanitizeMessage(msg, secretToRedact);
+}
+
+function parseGeminiError(rawText: string, status: number, secretToRedact?: string): string {
+  if (status === 401 || status === 403) {
+    return 'Invalid Gemini API key or insufficient API permissions.';
+  }
+  if (status === 429) {
+    return 'Gemini API quota or rate limit exceeded. Please wait or switch to External Gemini (No Key).';
+  }
+  let msg = `Gemini API error (${status})`;
+  try {
+    const parsed = JSON.parse(rawText) as { error?: { message?: string } | string; message?: string };
+    if (typeof parsed?.error === 'object' && parsed.error?.message) {
+      msg = parsed.error.message;
+    } else if (typeof parsed?.error === 'string') {
+      msg = parsed.error;
+    } else if (typeof parsed?.message === 'string') {
+      msg = parsed.message;
+    }
+  } catch {
+    const trimmed = (rawText || '').trim();
+    if (trimmed && !isHtmlBody(trimmed) && status < 500) {
+      msg = `${msg}: ${trimmed.slice(0, 220)}`;
+    }
+  }
+  if (/api key not valid/i.test(msg)) {
+    return 'Invalid Gemini API key. Check your key in Settings -> Gemini API Settings.';
+  }
+  return sanitizeMessage(msg, secretToRedact);
+}
+
+function extractJsonPayload(rawText: string): string {
+  const cleaned = rawText.trim();
+  const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence && fence[1]) {
+    return fence[1].trim();
+  }
+  return cleaned;
 }
 
 function mapIsoToLanguageName(code?: string): string {
@@ -211,12 +275,17 @@ async function handleFishVoices(request: Request, env: PagesEnv, url: URL): Prom
     qs.set('language', LANGUAGE_TO_ISO[lang]);
   }
 
-  const upstream = await fetch(`${getFishBase(env)}/model?${qs.toString()}`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-  });
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${getFishBase(env)}/model?${qs.toString()}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
+  } catch {
+    return jsonResponse(request, { error: 'Unable to connect to Fish Audio API.' }, 502);
+  }
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '');
@@ -227,7 +296,7 @@ async function handleFishVoices(request: Request, env: PagesEnv, url: URL): Prom
     );
   }
 
-  const payload = (await upstream.json()) as {
+  const payload = (await upstream.json().catch(() => ({}))) as {
     total?: number;
     items?: Array<{
       _id?: string;
@@ -311,14 +380,19 @@ async function handleFishAsr(
     outForm.append('language', isoLang);
   }
 
-  const upstream = await fetch(`${getFishBase(env)}/v1/asr`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      model: 'transcribe-1-pro',
-    },
-    body: outForm,
-  });
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${getFishBase(env)}/v1/asr`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        model: 'transcribe-1-pro',
+      },
+      body: outForm,
+    });
+  } catch {
+    return jsonResponse(request, { error: 'Unable to reach Fish Audio ASR endpoint.' }, 502);
+  }
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '');
@@ -329,7 +403,7 @@ async function handleFishAsr(
     );
   }
 
-  const data = (await upstream.json()) as {
+  const data = (await upstream.json().catch(() => null)) as {
     text?: string;
     duration?: number;
     language?: string;
@@ -347,7 +421,11 @@ async function handleFishAsr(
       speaker?: string | number;
       speaker_id?: string | number;
     }>;
-  };
+  } | null;
+
+  if (!data) {
+    return jsonResponse(request, { error: 'Fish Audio ASR returned an invalid JSON payload.' }, 502);
+  }
 
   const totalDur = Math.max(0.5, Number(data.duration) || durationInput || 10);
   const rawSegs =
@@ -366,9 +444,9 @@ async function handleFishAsr(
       const rawSpeaker = s.speaker ?? s.speaker_id;
       const speaker =
         rawSpeaker !== undefined && rawSpeaker !== null && String(rawSpeaker).trim() !== ''
-          ? String(rawSpeaker).startsWith('Speaker')
-            ? String(rawSpeaker)
-            : `Speaker ${rawSpeaker}`
+          ? /^speaker/i.test(String(rawSpeaker).trim())
+            ? String(rawSpeaker).trim()
+            : `Speaker ${String(rawSpeaker).trim()}`
           : undefined;
 
       return {
@@ -438,20 +516,109 @@ async function handleFishAsr(
   });
 }
 
+const GEMINI_FLASH_MODELS = ['gemini-3.8-flash', 'gemini-4-hydrogen', 'gemini-2.5-flash'] as const;
+
+async function fetchGeminiGenerateContent(
+  apiKey: string,
+  payload: Record<string, unknown>
+): Promise<{ response: Response; model: string }> {
+  let lastRes: Response | null = null;
+  let lastModel: string = GEMINI_FLASH_MODELS[0];
+  for (const model of GEMINI_FLASH_MODELS) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
+        apiKey
+      )}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+    lastRes = res;
+    lastModel = model;
+    if (res.ok || res.status !== 404) {
+      return { response: res, model };
+    }
+  }
+  return { response: lastRes!, model: lastModel };
+}
+
+async function handleGeminiTest(request: Request, env: PagesEnv): Promise<Response> {
+  const apiKey = readGeminiKey(request, env);
+  if (!apiKey) {
+    return jsonResponse(
+      request,
+      {
+        ok: false,
+        status: 'not_configured',
+        error:
+          'No Gemini API key configured. Add your personal Gemini API key in Settings -> Gemini API Settings, or use External Gemini (No Key) mode for free.',
+      },
+      401
+    );
+  }
+
+  let upstream: Response;
+  let connectedModel = GEMINI_FLASH_MODELS[0] as string;
+  try {
+    const result = await fetchGeminiGenerateContent(apiKey, {
+      contents: [{ parts: [{ text: 'Reply with OK' }] }],
+      generationConfig: { maxOutputTokens: 8 },
+    });
+    upstream = result.response;
+    connectedModel = result.model;
+  } catch {
+    return jsonResponse(
+      request,
+      {
+        ok: false,
+        status: 'connection_error',
+        error: 'Unable to reach Gemini API from Cloudflare Pages Function.',
+      },
+      502
+    );
+  }
+
+  if (!upstream.ok) {
+    const errText = await upstream.text().catch(() => '');
+    const parsedErr = parseGeminiError(errText, upstream.status, apiKey);
+    const isAuthErr =
+      upstream.status === 401 ||
+      upstream.status === 403 ||
+      /invalid gemini api key/i.test(parsedErr);
+    return jsonResponse(
+      request,
+      {
+        ok: false,
+        status: isAuthErr ? 'invalid_key' : 'connection_error',
+        error: parsedErr,
+      },
+      isAuthErr ? 401 : upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502
+    );
+  }
+
+  return jsonResponse(request, {
+    ok: true,
+    status: 'connected',
+    message: `Connected to Gemini API (${connectedModel}).`,
+  });
+}
+
 async function handleGeminiTranslate(
   request: Request,
   env: PagesEnv,
   projectId: string
 ): Promise<Response> {
-  const apiKey = readGeminiKey(env);
+  const apiKey = readGeminiKey(request, env);
   if (!apiKey) {
     return jsonResponse(
       request,
       {
         error:
-          'GEMINI_API_KEY is not configured in Cloudflare Pages Variables/Secrets. Use External Gemini (No Key) mode or add GEMINI_API_KEY in Cloudflare Pages settings.',
+          'Gemini API key is not configured. Add your personal Gemini API key in Settings -> Gemini API Settings, or use the free External Gemini (No Key) workflow.',
       },
-      503
+      401
     );
   }
 
@@ -462,6 +629,7 @@ async function handleGeminiTranslate(
       end: number;
       text: string;
       translatedText?: string;
+      speaker?: string;
     }>;
     sourceLanguage?: string;
     targetLanguage?: string;
@@ -487,45 +655,65 @@ async function handleGeminiTranslate(
     preserveProperNouns
       ? 'Preserve character names, movie titles, and proper nouns accurately.'
       : '',
-    'Keep translations concise and natural for spoken voiceover narration fitting roughly the same segment duration.',
+    'Keep translations complete, faithful, and natural for spoken voiceover narration at 1.0x speed.',
     'Return ONLY a JSON array of objects matching [{ "id": "...", "translatedText": "..." }].',
-    JSON.stringify(captions.map((c) => ({ id: c.id, text: c.text }))),
+    JSON.stringify(
+      captions.map((c) => ({
+        id: c.id,
+        speaker: c.speaker || undefined,
+        text: c.text,
+      }))
+    ),
   ]
     .filter(Boolean)
     .join('\n\n');
 
-  const geminiRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
-      apiKey
-    )}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-        },
-      }),
-    }
-  );
+  let geminiRes: Response;
+  try {
+    const result = await fetchGeminiGenerateContent(apiKey, {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+      },
+    });
+    geminiRes = result.response;
+  } catch {
+    return jsonResponse(
+      request,
+      { error: 'Unable to reach Gemini API for automatic translation.' },
+      502
+    );
+  }
 
   if (!geminiRes.ok) {
     const errText = await geminiRes.text().catch(() => '');
     return jsonResponse(
       request,
-      { error: `Gemini translation error (${geminiRes.status}): ${errText.slice(0, 220)}` },
+      { error: parseGeminiError(errText, geminiRes.status, apiKey) },
       geminiRes.status >= 400 && geminiRes.status < 500 ? geminiRes.status : 502
     );
   }
 
-  const geminiJson = (await geminiRes.json()) as {
+  const geminiJson = (await geminiRes.json().catch(() => ({}))) as {
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
   };
   const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  let translatedList: Array<{ id: string; translatedText: string }> = [];
+
+  let translatedList: Array<{ id?: string; translatedText?: string }> = [];
   try {
-    translatedList = JSON.parse(rawText) as Array<{ id: string; translatedText: string }>;
+    const parsed = JSON.parse(extractJsonPayload(rawText)) as
+      | Array<{ id?: string; translatedText?: string }>
+      | {
+          translations?: Array<{ id?: string; translatedText?: string }>;
+          segments?: Array<{ id?: string; translatedText?: string }>;
+        };
+    if (Array.isArray(parsed)) {
+      translatedList = parsed;
+    } else if (parsed && Array.isArray(parsed.translations)) {
+      translatedList = parsed.translations;
+    } else if (parsed && Array.isArray(parsed.segments)) {
+      translatedList = parsed.segments;
+    }
   } catch {
     return jsonResponse(
       request,
@@ -534,11 +722,22 @@ async function handleGeminiTranslate(
     );
   }
 
-  const byId = new Map(translatedList.map((item) => [item.id, item.translatedText]));
-  const updatedCaptions = captions.map((seg) => ({
-    ...seg,
-    translatedText: byId.get(seg.id) || seg.translatedText || seg.text,
-  }));
+  const byId = new Map<string, string>();
+  for (const item of translatedList) {
+    if (item && typeof item.id === 'string' && typeof item.translatedText === 'string') {
+      byId.set(item.id, item.translatedText.trim());
+    }
+  }
+
+  const updatedCaptions = captions.map((seg) => {
+    const nextTranslated = byId.get(seg.id) || seg.translatedText || seg.text;
+    return {
+      ...seg,
+      speaker: seg.speaker,
+      translatedText: nextTranslated,
+      words: distributeWordsEvenly(nextTranslated, Number(seg.start) || 0, Number(seg.end) || 1),
+    };
+  });
 
   return jsonResponse(request, {
     project: {
@@ -580,7 +779,7 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
 
   if (path === '/api/system/status' && request.method === 'GET') {
     return jsonResponse(request, {
-      geminiConfigured: Boolean(readGeminiKey(env)),
+      geminiConfigured: Boolean(readGeminiKey(request, env)),
       fishConfigured: Boolean(readFishKey(request, env)),
       ffmpegAvailable: false,
       ffprobeAvailable: false,
@@ -591,6 +790,17 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
       supportedVideoFormats: ['MP4', 'MOV', 'MKV'],
       supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
     });
+  }
+
+  if (path === '/api/gemini/test') {
+    if (request.method !== 'POST') {
+      return jsonResponse(
+        request,
+        { error: 'Method Not Allowed. Only POST requests are accepted at /api/gemini/test.' },
+        405
+      );
+    }
+    return handleGeminiTest(request, env);
   }
 
   if (path === '/api/fish/status' && request.method === 'GET') {
@@ -629,9 +839,49 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
     return jsonResponse(request, { workerEdgeMode: true });
   }
 
+  if (
+    /^\/api\/projects\/[^/]+\/dubbing\/(resync|regenerate-segments)$/.test(path) &&
+    request.method === 'POST'
+  ) {
+    return jsonResponse(
+      request,
+      {
+        error:
+          'This audio clips timeline lives in your browser IndexedDB storage. Re-run synchronization or clip regeneration directly in the studio.',
+      },
+      400
+    );
+  }
+
+  if (
+    /^\/api\/projects\/[^/]+\/(transcribe|voice\/preview|voice\/generate|voice\/auto-dub)$/.test(
+      path
+    )
+  ) {
+    return jsonResponse(
+      request,
+      {
+        error:
+          'Legacy server-disk voice route is disabled on Cloudflare Pages. Use Fish Audio ASR (/api/fish/asr) and Fish Audio TTS (/api/fish-audio) instead.',
+      },
+      400
+    );
+  }
+
   const translateMatch = path.match(/^\/api\/projects\/([^/]+)\/translate$/);
   if (translateMatch && request.method === 'POST') {
     return handleGeminiTranslate(request, env, translateMatch[1]);
+  }
+
+  if (/^\/api\/jobs\/[^/]+$/.test(path)) {
+    return jsonResponse(
+      request,
+      {
+        error:
+          'Browser-local dubbing or render job is no longer running (page was reloaded or job expired).',
+      },
+      404
+    );
   }
 
   return jsonResponse(

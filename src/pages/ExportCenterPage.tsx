@@ -2,20 +2,19 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
+  Archive,
   CheckCircle2,
   Clock,
-  Cloud,
   Download,
   Eye,
   Film,
   Flame,
+  HardDrive,
   Loader2,
   Mic,
   Palette,
   RefreshCw,
-  RotateCcw,
   Type,
-  XCircle,
 } from 'lucide-react';
 import {
   DEFAULT_VIDEO_CANVAS,
@@ -29,11 +28,9 @@ import { getMediaBlob, isLocalMediaUri, resolveBrowserMediaUrl } from '../lib/br
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import {
   downloadProjectAsset,
-  getCloudSession,
-  isSupabaseConfigured,
   resolvePlayableAssetUrl,
-  uploadSingleProjectAssetToCloud,
 } from '../lib/supabaseCloud';
+import { exportProjectBackupZip } from '../lib/projectBackup';
 import {
   countMissingTranslations,
   createWorkflowUpdate,
@@ -56,7 +53,6 @@ export function ExportCenterPage({
 }: ExportCenterPageProps) {
   const draftVideoRef = useRef<HTMLVideoElement | null>(null);
   const finalVideoRef = useRef<HTMLVideoElement | null>(null);
-  const cloudUploadAbortRef = useRef<AbortController | null>(null);
 
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [activeJob, setActiveJob] = useState<RenderJob | null>(null);
@@ -81,10 +77,8 @@ export function ExportCenterPage({
     dur: number;
   } | null>(null);
 
-  const [cloudUploading, setCloudUploading] = useState(false);
-  const [cloudUploadPct, setCloudUploadPct] = useState<number | null>(null);
-  const [cloudUploadStage, setCloudUploadStage] = useState<string | null>(null);
-  const [cloudUploadError, setCloudUploadError] = useState<string | null>(null);
+  const [savingBackupZip, setSavingBackupZip] = useState(false);
+  const [backupZipStatus, setBackupZipStatus] = useState<string | null>(null);
   const [downloadingTarget, setDownloadingTarget] = useState<'final' | 'original' | null>(null);
 
   const settings = project.exportSettings;
@@ -160,55 +154,23 @@ export function ExportCenterPage({
     [project.cloudAssets, project.lastExportedAt]
   );
 
-  const uploadFinalMp4ToCloud = useCallback(
-    async (targetProject: Project) => {
-      if (!targetProject.lastExportUrl) return;
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setCloudUploadError('Offline: Final MP4 saved locally. Connect online to upload to cloud.');
-        return;
-      }
-      if (!isSupabaseConfigured()) return;
-      const { user } = await getCloudSession();
-      if (!user) return;
-
-      const controller = new AbortController();
-      cloudUploadAbortRef.current = controller;
-      setCloudUploading(true);
-      setCloudUploadPct(0);
-      setCloudUploadStage('Preparing Final MP4 for Supabase Cloud upload...');
-      setCloudUploadError(null);
-
-      try {
-        const res = await uploadSingleProjectAssetToCloud(
-          targetProject,
-          targetProject.lastExportUrl,
-          {
-            signal: controller.signal,
-            onProgress: (pct, stage) => {
-              setCloudUploadPct(pct);
-              setCloudUploadStage(stage);
-            },
-          }
-        );
-        onProjectUpdated(res.project);
-        if (res.failedUploads.length > 0) {
-          setCloudUploadError(res.failedUploads[0].reason);
-        } else if (res.skippedLargeAssets.length > 0) {
-          setCloudUploadError(res.skippedLargeAssets[0].reason);
-        } else if (res.cancelled) {
-          setCloudUploadError('Cloud upload cancelled by user. Local MP4 preserved.');
-        } else {
-          setCloudUploadStage(res.message);
-        }
-      } catch (err) {
-        setCloudUploadError(err instanceof Error ? err.message : String(err));
-      } finally {
-        cloudUploadAbortRef.current = null;
-        setCloudUploading(false);
-      }
-    },
-    [onProjectUpdated]
-  );
+  const handleDownloadPortableBackup = async () => {
+    setSavingBackupZip(true);
+    setBackupZipStatus(null);
+    setErrorMsg(null);
+    try {
+      const res = await exportProjectBackupZip(project, (_pct, label) => {
+        setBackupZipStatus(label);
+      });
+      setBackupZipStatus(
+        `Saved ${res.filename} (${formatBytes(res.totalBytes)}, ${res.assetCount} asset(s)).`
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingBackupZip(false);
+    }
+  };
 
   useEffect(() => {
     void verifyExportedFile(project.lastExportUrl);
@@ -227,7 +189,7 @@ export function ExportCenterPage({
     });
   }, [project.id]);
 
-  // Poll active background render job every 900ms
+  // Poll active background render job every 400ms
   useEffect(() => {
     if (!activeJob || (activeJob.status !== 'queued' && activeJob.status !== 'processing')) {
       return;
@@ -251,7 +213,6 @@ export function ExportCenterPage({
           onProjectUpdated(synced);
           setPreviewMode('rendered');
           void verifyExportedFile(synced.lastExportUrl);
-          void uploadFinalMp4ToCloud(synced);
         }
       } catch {
         // ignore transient poll errors
@@ -259,7 +220,7 @@ export function ExportCenterPage({
     }, 400);
 
     return () => clearInterval(timer);
-  }, [activeJob, project.id, onProjectUpdated, verifyExportedFile, uploadFinalMp4ToCloud]);
+  }, [activeJob, project.id, onProjectUpdated, verifyExportedFile]);
 
   const updateSettings = async (patch: Partial<ExportSettings>) => {
     const next = { ...settings, ...patch };
@@ -791,65 +752,42 @@ export function ExportCenterPage({
               </div>
             </div>
 
-            {/* Post-Render Cloud Storage Verification & Upload Bar */}
+            {/* Local Browser Storage Verification & Portable Backup Bar (Cloudflare-Free Architecture) */}
             {project.lastExportUrl && (
               <div className="p-3 rounded-lg bg-[#09090B] border border-white/[0.08] space-y-2 text-xs">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <Cloud
+                    <HardDrive
                       className={`w-4 h-4 shrink-0 ${
-                        project.cloudAssets?.[project.lastExportUrl.split('?')[0]]?.verified
-                          ? 'text-emerald-400'
-                          : 'text-amber-400'
+                        exportValidation === 'valid' ? 'text-emerald-400' : 'text-amber-400'
                       }`}
                     />
                     <span className="font-medium text-zinc-200">
-                      {cloudUploading
-                        ? cloudUploadStage || 'Uploading Final MP4 to Supabase Free Cloud...'
-                        : project.cloudAssets?.[project.lastExportUrl.split('?')[0]]?.verified
-                        ? `Final MP4 Cloud Verified (${formatBytes(
-                            project.cloudAssets[project.lastExportUrl.split('?')[0]]
-                              .verifiedSizeBytes || project.lastExportSize
-                          )}) · Accessible on all devices`
-                        : 'Final MP4 not yet verified in cloud storage'}
+                      {exportValidation === 'valid'
+                        ? `Verified in Browser IndexedDB (${formatBytes(project.lastExportSize)}) · Export a .recapbackup.zip to move projects between devices`
+                        : exportValidation === 'checking'
+                        ? 'Verifying rendered video in browser storage...'
+                        : 'Rendered video blob is unavailable — click GENERATE FINAL VIDEO to re-render.'}
                     </span>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    {cloudUploading ? (
-                      <button
-                        type="button"
-                        onClick={() => cloudUploadAbortRef.current?.abort()}
-                        className="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-200 text-[11px] font-medium flex items-center gap-1 cursor-pointer"
-                      >
-                        <XCircle className="w-3.5 h-3.5" />
-                        Cancel Upload
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => void uploadFinalMp4ToCloud(project)}
-                        className="px-2.5 py-1 rounded bg-violet-600/80 hover:bg-violet-500 text-white text-[11px] font-medium flex items-center gap-1 cursor-pointer"
-                      >
-                        {cloudUploadError ? (
-                          <RotateCcw className="w-3 h-3" />
-                        ) : (
-                          <Cloud className="w-3 h-3" />
-                        )}
-                        {cloudUploadError ? 'Retry Cloud Upload' : 'Upload Final MP4 to Cloud'}
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      disabled={savingBackupZip}
+                      onClick={() => void handleDownloadPortableBackup()}
+                      className="px-2.5 py-1 rounded bg-violet-600/80 hover:bg-violet-500 disabled:opacity-50 text-white text-[11px] font-medium flex items-center gap-1 cursor-pointer"
+                    >
+                      {savingBackupZip ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <Archive className="w-3 h-3" />
+                      )}
+                      {savingBackupZip ? 'Packaging Backup...' : 'Export .recapbackup.zip'}
+                    </button>
                   </div>
                 </div>
-                {cloudUploading && cloudUploadPct !== null && (
-                  <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-                    <div
-                      className="h-full bg-violet-500 transition-all"
-                      style={{ width: `${cloudUploadPct}%` }}
-                    />
-                  </div>
-                )}
-                {cloudUploadError && (
-                  <div className="text-[11px] text-amber-300">{cloudUploadError}</div>
+                {backupZipStatus && (
+                  <div className="text-[11px] text-emerald-300">{backupZipStatus}</div>
                 )}
               </div>
             )}

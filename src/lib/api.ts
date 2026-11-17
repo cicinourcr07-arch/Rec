@@ -42,6 +42,7 @@ import {
 } from './browserMediaStore';
 import {
   dataUrlToBlob,
+  extractBrowserAsrAudioChunks,
   extractBrowserAudioTrack,
   extractBrowserThumbnailFrames,
   probeAudioDuration,
@@ -66,6 +67,12 @@ import {
   getPersonalFishApiKey,
   hasPersonalFishApiKey,
 } from './fishKeyStore';
+import {
+  GeminiConnectionStatus,
+  getPersonalGeminiApiKey,
+  hasPersonalGeminiApiKey,
+} from './geminiKeyStore';
+import { syncSpeakersFromCaptions } from './speakers';
 import {
   applySyncPlanToClips,
   buildTimelineSyncPlan,
@@ -155,22 +162,47 @@ function isFishEndpointPath(url: string): boolean {
   );
 }
 
-function scrubSecretFromText(text: string, secret?: string | null): string {
+function isGeminiEndpointPath(url: string): boolean {
+  return (
+    url.startsWith('/api/gemini') ||
+    url.includes('/translate') ||
+    url.startsWith('/api/system/status')
+  );
+}
+
+function isHtmlResponseText(raw: string): boolean {
+  const t = raw.trim().toLowerCase();
+  return t.startsWith('<!doctype') || t.startsWith('<html') || t.includes('</html>');
+}
+
+function scrubSecretFromText(text: string, ...secrets: Array<string | null | undefined>): string {
   let clean = text;
-  if (secret && secret.length >= 4) {
-    clean = clean.split(secret).join('[redacted]');
+  for (const secret of secrets) {
+    if (secret && secret.length >= 4) {
+      clean = clean.split(secret).join('[redacted]');
+    }
   }
-  return clean.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
+  clean = clean.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
+  clean = clean.replace(/[?&]key=[^&\s"']+/gi, '?key=[redacted]');
+  return clean;
 }
 
 async function aiBackendRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const fullUrl = resolveApiUrl(url);
   const headers = new Headers(init?.headers || {});
-  let usedPersonalKey: string | null = null;
+  let usedFishKey: string | null = null;
+  let usedGeminiKey: string | null = null;
+
   if (isFishEndpointPath(url) && !headers.has('Authorization')) {
-    usedPersonalKey = await getPersonalFishApiKey();
-    if (usedPersonalKey) {
-      headers.set('Authorization', `Bearer ${usedPersonalKey}`);
+    usedFishKey = await getPersonalFishApiKey();
+    if (usedFishKey) {
+      headers.set('Authorization', `Bearer ${usedFishKey}`);
+    }
+  }
+  if (isGeminiEndpointPath(url) && !headers.has('X-Gemini-Api-Key')) {
+    usedGeminiKey = await getPersonalGeminiApiKey();
+    if (usedGeminiKey) {
+      headers.set('X-Gemini-Api-Key', usedGeminiKey);
     }
   }
 
@@ -178,14 +210,21 @@ async function aiBackendRequest<T>(url: string, init?: RequestInit): Promise<T> 
   try {
     res = await fetch(fullUrl, { ...init, headers });
   } catch (err) {
-    const detail = scrubSecretFromText(err instanceof Error ? err.message : String(err), usedPersonalKey);
+    const detail = scrubSecretFromText(
+      err instanceof Error ? err.message : String(err),
+      usedFishKey,
+      usedGeminiKey
+    );
     throw new Error(
       `Automated AI service is unreachable (${detail}). Video handling, preview, export, SRT/VTT import, and External Gemini (No Key) work 100% locally in your browser.`
     );
   }
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
   const raw = await res.text();
+  const looksHtml = contentType.includes('text/html') || isHtmlResponseText(raw);
+
   let data: Record<string, unknown> | null = null;
-  if (raw) {
+  if (raw && !looksHtml) {
     try {
       data = JSON.parse(raw) as Record<string, unknown>;
     } catch {
@@ -194,16 +233,29 @@ async function aiBackendRequest<T>(url: string, init?: RequestInit): Promise<T> 
   }
   if (!res.ok) {
     if (res.status === 405 || res.status === 404) {
+      const serverErr = typeof data?.error === 'string' ? data.error : '';
+      if (serverErr) {
+        throw new Error(scrubSecretFromText(serverErr, usedFishKey, usedGeminiKey));
+      }
       throw new Error(
-        `Automated server-side AI endpoint is unavailable on static hosting (HTTP ${res.status}). API keys are never exposed in frontend code — use External Gemini (No Key) mode or run with an AI backend configured.`
+        `API endpoint ${url} is unavailable on static hosting (HTTP ${res.status}). Ensure Cloudflare Pages Functions (/functions/api/*) are deployed, or use External Gemini (No Key) mode.`
       );
     }
     const errMsg =
-      typeof data?.error === 'string' ? data.error : `AI request failed (${res.status})`;
-    throw new Error(scrubSecretFromText(errMsg, usedPersonalKey));
+      typeof data?.error === 'string'
+        ? data.error
+        : looksHtml
+        ? `Received HTML error page instead of JSON from ${url} (HTTP ${res.status}).`
+        : `AI request failed (${res.status})`;
+    throw new Error(scrubSecretFromText(errMsg, usedFishKey, usedGeminiKey));
   }
   if (!data) {
-    throw new Error('Unexpected non-JSON response from AI endpoint.');
+    if (looksHtml) {
+      throw new Error(
+        `API route ${url} returned an HTML page instead of JSON. Deploy Cloudflare Pages with the /functions directory enabled (avoid static-only uploads without Functions).`
+      );
+    }
+    throw new Error(`Unexpected non-JSON response from AI endpoint (${url}).`);
   }
   return data as T;
 }
@@ -277,16 +329,20 @@ export const uploadVideoChunked = processLocalVideoUpload;
 export const api = {
   // Diagnostics: returns real browser status + optional AI server status without failing static sites
   getSystemStatus: async (): Promise<SystemStatus> => {
-    const localFishConfigured = await hasPersonalFishApiKey();
+    const [localFishConfigured, localGeminiConfigured] = await Promise.all([
+      hasPersonalFishApiKey(),
+      hasPersonalGeminiApiKey(),
+    ]);
     try {
       const serverStatus = await aiBackendRequest<SystemStatus>('/api/system/status');
       return {
         ...serverStatus,
         fishConfigured: Boolean(serverStatus.fishConfigured || localFishConfigured),
+        geminiConfigured: Boolean(serverStatus.geminiConfigured || localGeminiConfigured),
       };
     } catch {
       return {
-        geminiConfigured: false,
+        geminiConfigured: localGeminiConfigured,
         fishConfigured: localFishConfigured,
         ffmpegAvailable: typeof MediaRecorder !== 'undefined',
         ffprobeAvailable: typeof HTMLVideoElement !== 'undefined',
@@ -298,6 +354,87 @@ export const api = {
         supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
       };
     }
+  },
+
+  testGeminiConnection: async (overrideKey?: string): Promise<{
+    ok: boolean;
+    status: GeminiConnectionStatus;
+    message: string;
+  }> => {
+    const rawKey = overrideKey !== undefined ? overrideKey : await getPersonalGeminiApiKey();
+    const keyToTest = (rawKey || '').trim();
+    if (!keyToTest) {
+      return {
+        ok: false,
+        status: 'not_configured',
+        message: 'No Gemini API key configured. Enter and save your personal key, or use External Gemini (No Key) mode for free.',
+      };
+    }
+
+    const endpointUrl = resolveApiUrl('/api/gemini/test');
+    let res: Response;
+    try {
+      res = await fetch(endpointUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Gemini-Api-Key': keyToTest,
+        },
+        body: JSON.stringify({ action: 'test' }),
+      });
+    } catch (err) {
+      const detail = scrubSecretFromText(err instanceof Error ? err.message : String(err), keyToTest);
+      return {
+        ok: false,
+        status: 'connection_error',
+        message: `Unable to reach /api/gemini/test (${detail}).`,
+      };
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const raw = await res.text().catch(() => '');
+    const looksHtml = contentType.includes('text/html') || isHtmlResponseText(raw);
+    let parsed: Record<string, unknown> | null = null;
+    if (raw && !looksHtml) {
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+    }
+
+    if (res.ok && parsed?.ok) {
+      return {
+        ok: true,
+        status: 'connected',
+        message:
+          typeof parsed.message === 'string'
+            ? parsed.message
+            : 'Connected to Gemini API (gemini-2.5-flash).',
+      };
+    }
+
+    const rawErr =
+      (typeof parsed?.error === 'string' && parsed.error) ||
+      (typeof parsed?.message === 'string' && parsed.message) ||
+      (looksHtml
+        ? `Backend endpoint /api/gemini/test returned HTML instead of JSON (${res.status}). Deploy Cloudflare Pages Functions.`
+        : `Gemini connection check failed (${res.status}).`);
+    const cleanErr = scrubSecretFromText(rawErr, keyToTest);
+
+    if (res.status === 401 || res.status === 403 || parsed?.status === 'invalid_key') {
+      return {
+        ok: false,
+        status: 'invalid_key',
+        message: cleanErr || 'Invalid Gemini API key or insufficient permissions.',
+      };
+    }
+
+    return {
+      ok: false,
+      status: 'connection_error',
+      message: cleanErr,
+    };
   },
 
   testFishConnection: async (overrideKey?: string): Promise<{
@@ -1079,6 +1216,18 @@ export const api = {
     ) {
       return { job: localJob };
     }
+    if (localJob && !API_BASE_URL) {
+      const interrupted: RenderJob = {
+        ...localJob,
+        status: 'failed',
+        etaSeconds: null,
+        error:
+          'Dubbing job was interrupted by a page reload. Any completed segment clips were saved — click Generate Voice to resume.',
+        updatedAt: new Date().toISOString(),
+      };
+      await upsertJobLocal(interrupted);
+      return { job: interrupted };
+    }
     const res = await aiBackendRequest<{
       job: RenderJob;
       dubResult?: { captions: Project['captions']; voicePatch: Partial<Project['voice']> };
@@ -1089,6 +1238,7 @@ export const api = {
         if (localProject) {
           await updateProjectLocal(res.job.projectId, {
             captions: res.dubResult.captions,
+            speakers: syncSpeakersFromCaptions(localProject.speakers, res.dubResult.captions),
             voice: {
               ...localProject.voice,
               ...res.dubResult.voicePatch,
@@ -1102,7 +1252,7 @@ export const api = {
   },
   listAllJobs: async () => ({ jobs: await listAllJobsLocal() }),
 
-  // Automated Server-Side Key-Protected AI Calls (never expose GEMINI_API_KEY / FISH_API_KEY in frontend)
+  // Automated AI Calls (keys stored strictly in user's browser IndexedDB or Cloudflare Env Secrets)
   translate: async (
     projectId: string,
     targetLanguage: SupportedLanguage,
@@ -1120,10 +1270,19 @@ export const api = {
         sourceLanguage: localProject.translation.sourceLanguage,
       }),
     });
+    const nextCaptions = res.project.captions.map((seg, idx) => ({
+      ...seg,
+      speaker: seg.speaker ?? localProject.captions[idx]?.speaker,
+    }));
     const merged = await updateProjectLocal(projectId, {
-      captions: res.project.captions,
+      captions: nextCaptions,
+      speakers: syncSpeakersFromCaptions(localProject.speakers, nextCaptions),
       translation: res.project.translation,
-      subtitleStyle: res.project.subtitleStyle,
+      subtitleStyle: {
+        ...localProject.subtitleStyle,
+        ...(res.project.subtitleStyle || {}),
+        useTranslated: true,
+      },
     });
     return { project: merged };
   },
@@ -1155,55 +1314,80 @@ export const api = {
       throw new Error('Select a video before running Fish Audio transcription.');
     }
 
-    let res: { project: Project; detectedLanguage: string; segmentCount: number };
+    let mergedCaptions: Project['captions'] = [];
+    let detectedLanguage = sourceLanguage || 'Auto';
+
     if (isLocalMediaUri(localProject.sourceVideoUrl)) {
-      const videoBlob = await getMediaBlob(localProject.sourceVideoUrl);
-      if (!videoBlob) {
-        throw new Error('Video file is unavailable in browser storage. Please re-select the video.');
-      }
-      const extracted = await extractBrowserAudioTrack({
+      const chunks = await extractBrowserAsrAudioChunks({
         sourceUri: localProject.sourceVideoUrl,
         sourceFilename: localProject.sourceFilename || 'video.mp4',
       });
-      const wavBlob = await getMediaBlob(extracted.audioUrl);
-      if (!wavBlob) {
-        throw new Error('Failed to read extracted browser audio track for transcription.');
+      if (chunks.length === 0) {
+        throw new Error('Could not extract any audio frames from the selected video.');
       }
-      const formData = new FormData();
-      formData.append('audio', wavBlob, extracted.filename || 'audio.wav');
-      formData.append('duration', String(localProject.metadata?.duration || 10));
-      if (sourceLanguage) {
-        formData.append('sourceLanguage', sourceLanguage);
-      }
-      res = await aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
-        `/api/projects/${projectId}/dubbing/transcribe`,
-        {
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const formData = new FormData();
+        formData.append('audio', chunk.blob, chunk.filename);
+        formData.append('duration', String(Math.max(1, Math.round(chunk.durationSec * 100) / 100)));
+        if (sourceLanguage) {
+          formData.append('sourceLanguage', sourceLanguage);
+        }
+
+        const chunkRes = await aiBackendRequest<{
+          project?: { captions: Project['captions'] };
+          segments?: Project['captions'];
+          detectedLanguage: string;
+        }>(i === 0 ? `/api/projects/${projectId}/dubbing/transcribe` : `/api/fish/asr`, {
           method: 'POST',
           body: formData,
+        });
+
+        const chunkSegments = chunkRes.project?.captions || chunkRes.segments || [];
+        if (i === 0 && chunkRes.detectedLanguage) {
+          detectedLanguage = chunkRes.detectedLanguage;
         }
-      );
+        const shifted = chunkSegments.map((seg) => ({
+          ...seg,
+          start: Math.round((seg.start + chunk.offsetSec) * 100) / 100,
+          end: Math.round((seg.end + chunk.offsetSec) * 100) / 100,
+          words: seg.words?.map((w) => ({
+            ...w,
+            start: Math.round((w.start + chunk.offsetSec) * 100) / 100,
+            end: Math.round((w.end + chunk.offsetSec) * 100) / 100,
+          })),
+        }));
+        mergedCaptions.push(...shifted);
+      }
+      mergedCaptions.sort((a, b) => a.start - b.start);
     } else {
-      res = await aiBackendRequest<{ project: Project; detectedLanguage: string; segmentCount: number }>(
-        `/api/projects/${projectId}/dubbing/transcribe`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sourceLanguage }),
-        }
-      );
+      const res = await aiBackendRequest<{
+        project: Project;
+        detectedLanguage: string;
+        segmentCount: number;
+      }>(`/api/projects/${projectId}/dubbing/transcribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceLanguage }),
+      });
+      mergedCaptions = res.project.captions;
+      detectedLanguage = res.detectedLanguage;
     }
 
+    const syncedSpeakers = syncSpeakersFromCaptions(localProject.speakers, mergedCaptions);
     const merged = await updateProjectLocal(projectId, {
-      captions: res.project.captions,
+      captions: mergedCaptions,
+      speakers: syncedSpeakers,
       translation: {
         ...localProject.translation,
-        sourceLanguage: res.detectedLanguage,
+        sourceLanguage: detectedLanguage,
       },
     });
     return {
       project: merged,
-      detectedLanguage: res.detectedLanguage,
-      segmentCount: res.segmentCount,
+      detectedLanguage,
+      segmentCount: mergedCaptions.length,
     };
   },
 
@@ -1252,7 +1436,12 @@ export const api = {
 
   generateFishDub: async (
     projectId: string,
-    params: { voice: Project['voice']; captions?: Project['captions']; useTranslated?: boolean }
+    params: {
+      voice: Project['voice'];
+      captions?: Project['captions'];
+      useTranslated?: boolean;
+      skipExistingValid?: boolean;
+    }
   ) => {
     const localProject = await getProjectLocal(projectId);
     const personalKey = await getPersonalFishApiKey();
@@ -1305,6 +1494,19 @@ export const api = {
           useTranslated: params.useTranslated ?? true,
           fishEndpointUrl: resolveApiUrl('/api/fish-audio'),
           apiKey: personalKey,
+          skipExistingValid: params.skipExistingValid,
+          onClipGenerated: async (clipsSoFar) => {
+            const latest = (await getProjectLocal(projectId)) || localProject;
+            await updateProjectLocal(projectId, {
+              voice: {
+                ...latest.voice,
+                ...params.voice,
+                provider: 'fish',
+                speakingSpeed: 1.0,
+                generatedClips: clipsSoFar,
+              },
+            });
+          },
           onProgress: (progress, stage, etaSeconds) => {
             void upsertJobLocal({
               ...initialJob,
@@ -1319,6 +1521,7 @@ export const api = {
 
         await updateProjectLocal(projectId, {
           captions,
+          speakers: syncSpeakersFromCaptions(localProject.speakers, captions),
           voice: {
             ...localProject.voice,
             ...params.voice,
@@ -1350,7 +1553,7 @@ export const api = {
           ...initialJob,
           status: 'failed',
           progress: 0,
-          stage: 'Fish Audio dubbing failed',
+          stage: 'Fish Audio dubbing failed (completed clips preserved)',
           etaSeconds: null,
           error: err instanceof Error ? err.message : String(err),
           updatedAt: new Date().toISOString(),
@@ -1476,6 +1679,7 @@ export const api = {
       );
       const updated = await updateProjectLocal(projectId, {
         captions,
+        speakers: syncSpeakersFromCaptions(localProject.speakers, captions),
         translation: {
           ...localProject.translation,
           pendingRegenerateSegmentIds: remainingPending,

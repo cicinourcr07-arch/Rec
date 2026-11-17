@@ -450,6 +450,16 @@ export interface GeneratedVoiceClip {
   overflowSeconds?: number;
   text: string;
   speaker?: string;
+  voiceIdUsed?: string;
+}
+
+export interface SpeakerProfile {
+  id: string;
+  name: string;
+  fishReferenceId?: string;
+  fishVoiceTitle?: string;
+  color?: string;
+  notes?: string;
 }
 
 export interface VoiceConfig {
@@ -833,6 +843,7 @@ export interface Project {
   subtitleStyle: SubtitleStyle;
   translation: TranslationConfig;
   voice: VoiceConfig;
+  speakers?: SpeakerProfile[];
   blurs: BlurEffect[];
   logos: LogoOverlay[];
   videoEffects: VideoEffectsConfig;
