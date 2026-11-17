@@ -368,7 +368,34 @@ export const api = {
       return {
         ok: false,
         status: 'invalid_key',
-        message: cleanErr || 'Invalid Fish Audio API key.',
+        message: cleanErr || 'Invalid Fish Audio API key or unauthorized access.',
+      };
+    }
+
+    if (res.status === 402) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        message: cleanErr || 'Fish Audio account balance or credits are insufficient.',
+      };
+    }
+
+    if (res.status === 429) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        message: cleanErr || 'Fish Audio API rate limit exceeded. Please wait and try again.',
+      };
+    }
+
+    if (res.status === 405) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        message:
+          parsed && typeof parsed.error === 'string'
+            ? cleanErr
+            : 'Backend endpoint /api/fish-audio rejected POST (HTTP 405). Deploy with Cloudflare Pages Functions enabled.',
       };
     }
 

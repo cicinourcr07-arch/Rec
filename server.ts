@@ -429,13 +429,15 @@ app.post(['/api/fish-audio', '/api/fish/tts'], async (req, res) => {
         return;
       }
       const testRes = await testFishAudioConnection(apiKey);
-      const httpStatus =
-        testRes.status === 'connected'
+      const { httpStatus, ...payload } = testRes;
+      const status =
+        httpStatus ||
+        (testRes.status === 'connected'
           ? 200
           : testRes.status === 'invalid_key'
           ? 401
-          : 502;
-      res.status(httpStatus).json(testRes);
+          : 502);
+      res.status(status).json(payload);
       return;
     }
 

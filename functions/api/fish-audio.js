@@ -197,30 +197,21 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
   let upstream;
   try {
     upstream = await fetchWithTimeout(
-      `${fishApiBase}/wallet/self/api-credit`,
+      `${fishApiBase}/v1/tts`,
       {
-        method: 'GET',
+        method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          model: DEFAULT_FISH_MODEL,
         },
+        body: JSON.stringify({
+          text: 'Connection test',
+          format: 'mp3',
+        }),
       },
       TEST_TIMEOUT_MS
     );
-
-    if (upstream.status === 404) {
-      upstream = await fetchWithTimeout(
-        `${fishApiBase}/model?self=true&page_size=1`,
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: 'application/json',
-          },
-        },
-        TEST_TIMEOUT_MS
-      );
-    }
   } catch (err) {
     const isTimeout = err instanceof Error && err.name === 'AbortError';
     return jsonResponse(
@@ -242,9 +233,21 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
       {
         ok: false,
         status: 'invalid_key',
-        error: 'Invalid Fish Audio API key.',
+        error: 'Invalid Fish Audio API key or unauthorized access.',
       },
       401
+    );
+  }
+
+  if (upstream.status === 402) {
+    return jsonResponse(
+      requestUrl,
+      {
+        ok: false,
+        status: 'connection_error',
+        error: 'Fish Audio account balance or credits are insufficient.',
+      },
+      402
     );
   }
 
@@ -275,21 +278,36 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
     );
   }
 
-  let creditInfo = null;
-  try {
-    const data = await upstream.json();
-    if (data && typeof data === 'object' && data.credit !== undefined) {
-      creditInfo = String(data.credit);
-    }
-  } catch {
-    // ignore non-critical JSON body details
+  const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
+  if (contentType.includes('text/html')) {
+    return jsonResponse(
+      requestUrl,
+      {
+        ok: false,
+        status: 'connection_error',
+        error: 'Unexpected HTML response from Fish Audio API endpoint.',
+      },
+      502
+    );
+  }
+
+  const responseBytes = await upstream.arrayBuffer().catch(() => new ArrayBuffer(0));
+  if (responseBytes.byteLength === 0) {
+    return jsonResponse(
+      requestUrl,
+      {
+        ok: false,
+        status: 'connection_error',
+        error: 'Fish Audio API returned an empty response.',
+      },
+      502
+    );
   }
 
   return jsonResponse(requestUrl, {
     ok: true,
     status: 'connected',
     message: 'Connected to Fish Audio API.',
-    ...(creditInfo !== null ? { credit: creditInfo } : {}),
   });
 }
 

@@ -99,61 +99,108 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
   status: 'connected' | 'invalid_key' | 'connection_error';
   message?: string;
   error?: string;
-  credit?: string;
+  httpStatus?: number;
 }> {
   const apiKey = getFishApiKey(overrideKey);
+  const redact = (msg: string) => {
+    let clean = String(msg || 'Fish Audio connection failed.');
+    if (apiKey.length >= 4) {
+      clean = clean.split(apiKey).join('[redacted]');
+    }
+    return clean.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
+  };
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000);
   try {
-    let res = await fetch(`${FISH_API_BASE}/wallet/self/api-credit`, {
-      method: 'GET',
+    const res = await fetch(`${FISH_API_BASE}/v1/tts`, {
+      method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
-        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        model: 's2.1-pro-free',
       },
+      body: JSON.stringify({
+        text: 'Connection test',
+        format: 'mp3',
+      }),
       signal: controller.signal,
     });
-    if (res.status === 404) {
-      res = await fetch(`${FISH_API_BASE}/model?self=true&page_size=1`, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: 'application/json',
-        },
-        signal: controller.signal,
-      });
-    }
+
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, status: 'invalid_key', error: 'Invalid Fish Audio API key.' };
+      return {
+        ok: false,
+        status: 'invalid_key',
+        error: 'Invalid Fish Audio API key or unauthorized access.',
+        httpStatus: 401,
+      };
+    }
+    if (res.status === 402) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        error: 'Fish Audio account balance or credits are insufficient.',
+        httpStatus: 402,
+      };
     }
     if (res.status === 429) {
       return {
         ok: false,
         status: 'connection_error',
-        error: 'Fish Audio API rate limit exceeded. Please try again shortly.',
+        error: 'Fish Audio API rate limit exceeded. Please wait and try again.',
+        httpStatus: 429,
       };
     }
     if (!res.ok) {
+      const rawErr = await res.text().catch(() => '');
+      let errMsg =
+        res.status >= 500
+          ? `Fish Audio server error (${res.status}). Please try again.`
+          : `Fish Audio API error (${res.status}).`;
+      try {
+        const parsed = JSON.parse(rawErr) as { message?: string; detail?: string; error?: string };
+        const detail = parsed.message || parsed.detail || parsed.error;
+        if (typeof detail === 'string' && detail.trim()) {
+          errMsg = detail.trim();
+        }
+      } catch {
+        if (rawErr.trim() && res.status < 500) {
+          errMsg = `${errMsg} ${rawErr.trim().slice(0, 180)}`;
+        }
+      }
       return {
         ok: false,
         status: 'connection_error',
-        error: `Fish Audio API returned HTTP ${res.status}.`,
+        error: redact(errMsg),
+        httpStatus: res.status >= 500 ? 502 : res.status,
       };
     }
-    let credit: string | undefined;
-    try {
-      const json = (await res.json()) as { credit?: unknown };
-      if (json && json.credit !== undefined) {
-        credit = String(json.credit);
-      }
-    } catch {
-      // ignore non-critical body parse issues
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        error: 'Unexpected HTML response from Fish Audio API endpoint.',
+        httpStatus: 502,
+      };
     }
+
+    const audioBytes = await res.arrayBuffer().catch(() => new ArrayBuffer(0));
+    if (audioBytes.byteLength === 0) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        error: 'Fish Audio API returned an empty response.',
+        httpStatus: 502,
+      };
+    }
+
     return {
       ok: true,
       status: 'connected',
       message: 'Connected to Fish Audio API.',
-      ...(credit !== undefined ? { credit } : {}),
+      httpStatus: 200,
     };
   } catch (err) {
     const isTimeout = err instanceof Error && err.name === 'AbortError';
@@ -163,6 +210,7 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
       error: isTimeout
         ? 'Connection to Fish Audio API timed out.'
         : 'Unable to reach Fish Audio API.',
+      httpStatus: isTimeout ? 504 : 502,
     };
   } finally {
     clearTimeout(timer);
