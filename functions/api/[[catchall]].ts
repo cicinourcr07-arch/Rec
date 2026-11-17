@@ -799,9 +799,16 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
   }
 
   if (path === '/api/system/status' && request.method === 'GET') {
+    const fishKeySource = readBearerFromRequest(request)
+      ? 'request_header'
+      : readFishKey(request, env)
+      ? 'server_env'
+      : 'none';
     return jsonResponse(request, {
       geminiConfigured: Boolean(readGeminiKey(request, env)),
-      fishConfigured: Boolean(readFishKey(request, env)),
+      fishConfigured: fishKeySource !== 'none',
+      fishKeySource,
+      functionsActive: true,
       ffmpegAvailable: false,
       ffprobeAvailable: false,
       ffmpegVersion: 'Cloudflare Pages Functions + Browser Web Audio/MediaRecorder',
@@ -825,8 +832,15 @@ async function handlePagesApiRequest(request: Request, env: PagesEnv): Promise<R
   }
 
   if (path === '/api/fish/status' && request.method === 'GET') {
+    const fishKeySource = readBearerFromRequest(request)
+      ? 'request_header'
+      : readFishKey(request, env)
+      ? 'server_env'
+      : 'none';
     return jsonResponse(request, {
-      configured: Boolean(readFishKey(request, env)),
+      configured: fishKeySource !== 'none',
+      keySource: fishKeySource,
+      functionsActive: true,
       ttsModel: 's2.1-pro-free',
       asrModel: 'transcribe-1-pro',
     });

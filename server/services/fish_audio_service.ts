@@ -97,6 +97,8 @@ function getFishApiKey(overrideKey?: string): string {
 export async function testFishAudioConnection(overrideKey?: string): Promise<{
   ok: boolean;
   status: 'connected' | 'invalid_key' | 'connection_error';
+  authenticated: boolean;
+  serviceReachable: boolean;
   message?: string;
   error?: string;
   httpStatus?: number;
@@ -127,10 +129,36 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
       signal: controller.signal,
     });
 
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        error: `Unexpected HTML response (${res.status}) from Fish Audio upstream.`,
+        httpStatus: 502,
+      };
+    }
+
     if (res.status === 401 || res.status === 403) {
+      const rawErr = await res.text().catch(() => '');
+      const trimmed = rawErr.trim().toLowerCase();
+      if (trimmed.startsWith('<!doctype') || trimmed.startsWith('<html')) {
+        return {
+          ok: false,
+          status: 'connection_error',
+          authenticated: false,
+          serviceReachable: false,
+          error: `Fish Audio upstream proxy returned HTML (${res.status}).`,
+          httpStatus: 502,
+        };
+      }
       return {
         ok: false,
         status: 'invalid_key',
+        authenticated: false,
+        serviceReachable: true,
         error: 'Invalid Fish Audio API key or unauthorized access.',
         httpStatus: 401,
       };
@@ -139,6 +167,8 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
       return {
         ok: false,
         status: 'connection_error',
+        authenticated: true,
+        serviceReachable: true,
         error: 'Fish Audio account balance or credits are insufficient.',
         httpStatus: 402,
       };
@@ -147,6 +177,8 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
       return {
         ok: false,
         status: 'connection_error',
+        authenticated: true,
+        serviceReachable: true,
         error: 'Fish Audio API rate limit exceeded. Please wait and try again.',
         httpStatus: 429,
       };
@@ -171,27 +203,33 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
       return {
         ok: false,
         status: 'connection_error',
+        authenticated: false,
+        serviceReachable: res.status < 500,
         error: redact(errMsg),
         httpStatus: res.status >= 500 ? 502 : res.status,
       };
     }
 
-    const contentType = (res.headers.get('content-type') || '').toLowerCase();
-    if (contentType.includes('text/html')) {
+    if (contentType.includes('application/json')) {
+      const rawJson = await res.text().catch(() => '');
       return {
         ok: false,
         status: 'connection_error',
-        error: 'Unexpected HTML response from Fish Audio API endpoint.',
+        authenticated: false,
+        serviceReachable: true,
+        error: redact(rawJson || 'Fish Audio API returned JSON instead of audio stream.'),
         httpStatus: 502,
       };
     }
 
     const audioBytes = await res.arrayBuffer().catch(() => new ArrayBuffer(0));
-    if (audioBytes.byteLength === 0) {
+    if (audioBytes.byteLength < 128) {
       return {
         ok: false,
         status: 'connection_error',
-        error: 'Fish Audio API returned an empty response.',
+        authenticated: false,
+        serviceReachable: true,
+        error: 'Fish Audio API returned an empty audio stream.',
         httpStatus: 502,
       };
     }
@@ -199,7 +237,9 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
     return {
       ok: true,
       status: 'connected',
-      message: 'Connected to Fish Audio API.',
+      authenticated: true,
+      serviceReachable: true,
+      message: 'Connected & authenticated with Fish Audio API.',
       httpStatus: 200,
     };
   } catch (err) {
@@ -207,6 +247,8 @@ export async function testFishAudioConnection(overrideKey?: string): Promise<{
     return {
       ok: false,
       status: 'connection_error',
+      authenticated: false,
+      serviceReachable: false,
       error: isTimeout
         ? 'Connection to Fish Audio API timed out.'
         : 'Unable to reach Fish Audio API.',

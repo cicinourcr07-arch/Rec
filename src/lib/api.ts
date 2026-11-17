@@ -64,8 +64,12 @@ import {
 } from './browserAudioDubbing';
 import {
   FishConnectionStatus,
+  FishIntegrationSnapshot,
+  getLastFishSnapshot,
   getPersonalFishApiKey,
   hasPersonalFishApiKey,
+  loadPersonalFishKeyState,
+  setLastFishSnapshot,
 } from './fishKeyStore';
 import {
   GeminiConnectionStatus,
@@ -329,21 +333,80 @@ export const uploadVideoChunked = processLocalVideoUpload;
 export const api = {
   // Diagnostics: returns real browser status + optional AI server status without failing static sites
   getSystemStatus: async (): Promise<SystemStatus> => {
-    const [localFishConfigured, localGeminiConfigured] = await Promise.all([
-      hasPersonalFishApiKey(),
+    const [localFishState, localGeminiConfigured] = await Promise.all([
+      loadPersonalFishKeyState(),
       hasPersonalGeminiApiKey(),
     ]);
+    const localFishConfigured = Boolean(localFishState.apiKey);
     try {
       const serverStatus = await aiBackendRequest<SystemStatus>('/api/system/status');
+      const fishKeySource: SystemStatus['fishKeySource'] = localFishConfigured
+        ? 'request_header'
+        : serverStatus.fishKeySource === 'server_env' || serverStatus.fishConfigured
+        ? 'server_env'
+        : 'none';
+      const functionsActive =
+        typeof serverStatus.functionsActive === 'boolean' ? serverStatus.functionsActive : true;
+
+      // Sync non-auth dimensions of snapshot without claiming authenticated unless verified
+      const prev = getLastFishSnapshot();
+      const localStorageMode: FishIntegrationSnapshot['localStorageMode'] = localFishConfigured
+        ? localFishState.rememberOnDevice
+          ? 'indexeddb'
+          : 'session'
+        : 'none';
+      const resolvedKeySource: FishIntegrationSnapshot['keySource'] = localFishConfigured
+        ? localStorageMode === 'indexeddb'
+          ? 'indexeddb'
+          : 'session'
+        : fishKeySource === 'server_env'
+        ? 'server_env'
+        : 'none';
+      setLastFishSnapshot({
+        ...prev,
+        integrationConfigured: functionsActive,
+        localKeySaved: localFishConfigured,
+        localStorageMode,
+        keySource: resolvedKeySource,
+        status:
+          resolvedKeySource === 'none' && prev.status !== 'connection_error'
+            ? 'not_configured'
+            : prev.status === 'not_configured' && resolvedKeySource !== 'none'
+            ? 'unverified'
+            : prev.status,
+      });
+
       return {
         ...serverStatus,
         fishConfigured: Boolean(serverStatus.fishConfigured || localFishConfigured),
+        fishKeySource,
+        functionsActive,
         geminiConfigured: Boolean(serverStatus.geminiConfigured || localGeminiConfigured),
       };
     } catch {
+      const prev = getLastFishSnapshot();
+      setLastFishSnapshot({
+        ...prev,
+        integrationConfigured: false,
+        localKeySaved: localFishConfigured,
+        localStorageMode: localFishConfigured
+          ? localFishState.rememberOnDevice
+            ? 'indexeddb'
+            : 'session'
+          : 'none',
+        keySource: localFishConfigured
+          ? localFishState.rememberOnDevice
+            ? 'indexeddb'
+            : 'session'
+          : 'none',
+        authenticated: false,
+        serviceReachable: false,
+      });
       return {
         geminiConfigured: localGeminiConfigured,
         fishConfigured: localFishConfigured,
+        fishKeySource: localFishConfigured ? 'request_header' : 'none',
+        functionsActive: false,
         ffmpegAvailable: typeof MediaRecorder !== 'undefined',
         ffprobeAvailable: typeof HTMLVideoElement !== 'undefined',
         ffmpegVersion: 'Browser Canvas + MediaRecorder',
@@ -437,43 +500,133 @@ export const api = {
     };
   },
 
-  testFishConnection: async (overrideKey?: string): Promise<{
+  testFishConnection: async (
+    overrideKey?: string,
+    opts?: { allowServerFallback?: boolean; updateSnapshot?: boolean }
+  ): Promise<{
     ok: boolean;
     status: FishConnectionStatus;
+    authenticated: boolean;
+    serviceReachable: boolean;
+    integrationConfigured: boolean;
+    localKeySaved: boolean;
+    localStorageMode: 'indexeddb' | 'session' | 'none';
+    keySource: 'indexeddb' | 'session' | 'server_env' | 'none';
     message: string;
     credit?: string;
   }> => {
-    const rawKey = overrideKey !== undefined ? overrideKey : await getPersonalFishApiKey();
+    const allowServerFallback = Boolean(opts?.allowServerFallback);
+    const shouldUpdateSnapshot = opts?.updateSnapshot !== false;
+    const localState = await loadPersonalFishKeyState();
+    const localKeySaved = Boolean(localState.apiKey);
+    const localStorageMode: 'indexeddb' | 'session' | 'none' = localKeySaved
+      ? localState.rememberOnDevice
+        ? 'indexeddb'
+        : 'session'
+      : 'none';
+
+    const rawKey = overrideKey !== undefined ? overrideKey : localState.apiKey;
     const keyToTest = (rawKey || '').trim();
-    if (!keyToTest) {
-      return {
+    const defaultKeySource: 'indexeddb' | 'session' | 'server_env' | 'none' = keyToTest
+      ? localState.apiKey === keyToTest
+        ? localStorageMode === 'indexeddb'
+          ? 'indexeddb'
+          : 'session'
+        : localStorageMode !== 'none'
+        ? localStorageMode
+        : 'session'
+      : allowServerFallback
+      ? 'server_env'
+      : 'none';
+
+    const finalize = (result: {
+      ok: boolean;
+      status: FishConnectionStatus;
+      authenticated: boolean;
+      serviceReachable: boolean;
+      integrationConfigured: boolean;
+      keySource: 'indexeddb' | 'session' | 'server_env' | 'none';
+      message: string;
+      credit?: string;
+    }) => {
+      const fullResult = {
+        ...result,
+        localKeySaved,
+        localStorageMode,
+      };
+      if (shouldUpdateSnapshot) {
+        setLastFishSnapshot({
+          status: result.status,
+          integrationConfigured: result.integrationConfigured,
+          localKeySaved,
+          localStorageMode,
+          keySource: result.keySource,
+          authenticated: result.authenticated,
+          serviceReachable: result.serviceReachable,
+          message: result.message,
+          checkedAt: new Date().toISOString(),
+        });
+      }
+      return fullResult;
+    };
+
+    if (!keyToTest && !allowServerFallback) {
+      return finalize({
         ok: false,
         status: 'not_configured',
+        authenticated: false,
+        serviceReachable: getLastFishSnapshot().serviceReachable,
+        integrationConfigured: getLastFishSnapshot().integrationConfigured,
+        keySource: 'none',
         message: 'No Fish Audio API key configured. Enter and save your personal API key.',
-      };
+      });
     }
 
     const endpointUrl = resolveApiUrl('/api/fish-audio');
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (keyToTest) {
+      headers.Authorization = `Bearer ${keyToTest}`;
+    }
+
     let res: Response;
     try {
       res = await fetch(endpointUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${keyToTest}`,
-        },
+        headers,
         body: JSON.stringify({ action: 'test' }),
       });
     } catch (err) {
       const detail = scrubSecretFromText(err instanceof Error ? err.message : String(err), keyToTest);
-      return {
+      return finalize({
         ok: false,
         status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        integrationConfigured: false,
+        keySource: keyToTest ? defaultKeySource : 'none',
         message: `Unable to reach /api/fish-audio (${detail}).`,
-      };
+      });
     }
 
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
     const raw = await res.text().catch(() => '');
+    const looksHtml = contentType.includes('text/html') || isHtmlResponseText(raw);
+
+    // CRITICAL: Never blame API key validity when Cloudflare/proxy returns an HTML fallback or error page
+    if (looksHtml) {
+      return finalize({
+        ok: false,
+        status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        integrationConfigured: false,
+        keySource: keyToTest ? defaultKeySource : 'none',
+        message: `API endpoint /api/fish-audio returned an HTML page instead of JSON (HTTP ${res.status}). Ensure Cloudflare Pages Functions (/functions/api/fish-audio.js) are deployed cleanly.`,
+      });
+    }
+
     let parsed: Record<string, unknown> | null = null;
     if (raw) {
       try {
@@ -483,64 +636,150 @@ export const api = {
       }
     }
 
-    if (res.ok && parsed?.ok) {
-      return {
+    if (!parsed) {
+      return finalize({
+        ok: false,
+        status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        integrationConfigured: res.status !== 404 && res.status !== 405,
+        keySource: keyToTest ? defaultKeySource : 'none',
+        message: `Unexpected non-JSON response from /api/fish-audio (HTTP ${res.status}).`,
+      });
+    }
+
+    const resolvedKeySource: 'indexeddb' | 'session' | 'server_env' | 'none' =
+      parsed.keySource === 'server_env'
+        ? 'server_env'
+        : parsed.keySource === 'none'
+        ? 'none'
+        : defaultKeySource;
+
+    const cleanServerMsg = scrubSecretFromText(
+      (typeof parsed.error === 'string' && parsed.error) ||
+        (typeof parsed.message === 'string' && parsed.message) ||
+        `Connection check failed (${res.status}).`,
+      keyToTest
+    );
+
+    // Only accept authenticated=true when response explicitly succeeded with ok===true and authenticated!==false
+    if (res.ok && parsed.ok === true && parsed.authenticated !== false) {
+      return finalize({
         ok: true,
         status: 'connected',
+        authenticated: true,
+        serviceReachable: parsed.serviceReachable !== false,
+        integrationConfigured: true,
+        keySource: resolvedKeySource === 'none' ? defaultKeySource : resolvedKeySource,
         message:
           typeof parsed.message === 'string'
             ? parsed.message
-            : 'Connected to Fish Audio API.',
+            : 'Connected & authenticated with Fish Audio API.',
         credit: typeof parsed.credit === 'string' ? parsed.credit : undefined,
-      };
+      });
     }
 
-    const rawErr =
-      (typeof parsed?.error === 'string' && parsed.error) ||
-      (typeof parsed?.message === 'string' && parsed.message) ||
-      `Connection check failed (${res.status}).`;
-    const cleanErr = scrubSecretFromText(rawErr, keyToTest);
+    // Missing key (both local & server)
+    if (parsed.status === 'not_configured' || (res.status === 401 && resolvedKeySource === 'none')) {
+      return finalize({
+        ok: false,
+        status: 'not_configured',
+        authenticated: false,
+        serviceReachable: Boolean(parsed.serviceReachable),
+        integrationConfigured: true,
+        keySource: 'none',
+        message:
+          cleanServerMsg ||
+          'No Fish Audio API key configured. Enter and save your personal API key.',
+      });
+    }
 
-    if (res.status === 401 || res.status === 403 || parsed?.status === 'invalid_key') {
-      return {
+    // Policy block (HTTPS/CORS/Origin 403 from our own Edge/server middleware) is NEVER an invalid API key
+    if (parsed.code === 'SECURITY_POLICY_BLOCKED') {
+      return finalize({
+        ok: false,
+        status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        integrationConfigured: true,
+        keySource: resolvedKeySource,
+        message: cleanServerMsg,
+      });
+    }
+
+    // Explicit authentication failure from Fish Audio upstream (HTTP 401 or JSON status === 'invalid_key')
+    if (parsed.status === 'invalid_key' || res.status === 401) {
+      return finalize({
         ok: false,
         status: 'invalid_key',
-        message: cleanErr || 'Invalid Fish Audio API key or unauthorized access.',
-      };
+        authenticated: false,
+        serviceReachable: parsed.serviceReachable !== false,
+        integrationConfigured: true,
+        keySource: resolvedKeySource,
+        message: cleanServerMsg || 'Invalid Fish Audio API key or unauthorized access.',
+      });
+    }
+
+    // Non-auth 403 (WAF/gateway policy) -> connection_error, NOT invalid_key
+    if (res.status === 403) {
+      return finalize({
+        ok: false,
+        status: 'connection_error',
+        authenticated: false,
+        serviceReachable: Boolean(parsed.serviceReachable),
+        integrationConfigured: true,
+        keySource: resolvedKeySource,
+        message: cleanServerMsg || 'Access blocked by gateway or origin policy (HTTP 403).',
+      });
     }
 
     if (res.status === 402) {
-      return {
+      return finalize({
         ok: false,
         status: 'connection_error',
-        message: cleanErr || 'Fish Audio account balance or credits are insufficient.',
-      };
+        authenticated: parsed.authenticated === true,
+        serviceReachable: true,
+        integrationConfigured: true,
+        keySource: resolvedKeySource,
+        message: cleanServerMsg || 'Fish Audio account balance or credits are insufficient.',
+      });
     }
 
     if (res.status === 429) {
-      return {
+      return finalize({
         ok: false,
         status: 'connection_error',
-        message: cleanErr || 'Fish Audio API rate limit exceeded. Please wait and try again.',
-      };
+        authenticated: parsed.authenticated === true,
+        serviceReachable: true,
+        integrationConfigured: true,
+        keySource: resolvedKeySource,
+        message: cleanServerMsg || 'Fish Audio API rate limit exceeded. Please wait and try again.',
+      });
     }
 
-    if (res.status === 405) {
-      return {
+    if (res.status === 405 || res.status === 404) {
+      return finalize({
         ok: false,
         status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        integrationConfigured: false,
+        keySource: resolvedKeySource,
         message:
-          parsed && typeof parsed.error === 'string'
-            ? cleanErr
-            : 'Backend endpoint /api/fish-audio rejected POST (HTTP 405). Deploy with Cloudflare Pages Functions enabled.',
-      };
+          cleanServerMsg ||
+          `Backend endpoint /api/fish-audio is unavailable (HTTP ${res.status}). Deploy with Cloudflare Pages Functions enabled.`,
+      });
     }
 
-    return {
+    return finalize({
       ok: false,
       status: 'connection_error',
-      message: cleanErr,
-    };
+      authenticated: parsed.authenticated === true,
+      serviceReachable: parsed.serviceReachable === true,
+      integrationConfigured: true,
+      keySource: resolvedKeySource,
+      message: cleanServerMsg,
+    });
   },
 
   getLocalStorageUsage: () => getBrowserMediaUsage(),

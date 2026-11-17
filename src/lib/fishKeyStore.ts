@@ -5,9 +5,22 @@
 
 export type FishConnectionStatus =
   | 'connected'
+  | 'unverified'
   | 'invalid_key'
   | 'connection_error'
   | 'not_configured';
+
+export interface FishIntegrationSnapshot {
+  status: FishConnectionStatus;
+  integrationConfigured: boolean;
+  localKeySaved: boolean;
+  localStorageMode: 'indexeddb' | 'session' | 'none';
+  keySource: 'indexeddb' | 'session' | 'server_env' | 'none';
+  authenticated: boolean;
+  serviceReachable: boolean;
+  message: string;
+  checkedAt: string | null;
+}
 
 interface StoredFishCredential {
   id: 'fish_audio_api_key';
@@ -23,6 +36,46 @@ const RECORD_ID = 'fish_audio_api_key';
 // Session-only memory holder when "Remember API Key on this device" is unchecked
 let sessionOnlyFishApiKey: string | null = null;
 let sessionUpdatedAt: string | null = null;
+
+let lastFishSnapshot: FishIntegrationSnapshot = {
+  status: 'not_configured',
+  integrationConfigured: false,
+  localKeySaved: false,
+  localStorageMode: 'none',
+  keySource: 'none',
+  authenticated: false,
+  serviceReachable: false,
+  message: 'No Fish Audio API key configured.',
+  checkedAt: null,
+};
+
+const snapshotListeners = new Set<(snapshot: FishIntegrationSnapshot) => void>();
+
+export function getLastFishSnapshot(): FishIntegrationSnapshot {
+  return lastFishSnapshot;
+}
+
+export function setLastFishSnapshot(next: FishIntegrationSnapshot): FishIntegrationSnapshot {
+  lastFishSnapshot = next;
+  snapshotListeners.forEach((listener) => {
+    try {
+      listener(next);
+    } catch {
+      // ignore subscriber errors
+    }
+  });
+  return next;
+}
+
+export function subscribeFishSnapshot(
+  listener: (snapshot: FishIntegrationSnapshot) => void
+): () => void {
+  snapshotListeners.add(listener);
+  listener(lastFishSnapshot);
+  return () => {
+    snapshotListeners.delete(listener);
+  };
+}
 
 function openPersonalKeyDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -126,6 +179,16 @@ export async function savePersonalFishApiKey(
     await withCredentialStore('readwrite', (store) => store.put(record));
     sessionOnlyFishApiKey = cleanKey;
     sessionUpdatedAt = now;
+    setLastFishSnapshot({
+      ...lastFishSnapshot,
+      status: 'unverified',
+      localKeySaved: true,
+      localStorageMode: 'indexeddb',
+      keySource: 'indexeddb',
+      authenticated: false,
+      message: 'API key saved locally in IndexedDB. Verifying with Fish Audio...',
+      checkedAt: null,
+    });
     return { rememberOnDevice: true, updatedAt: now };
   }
 
@@ -136,6 +199,16 @@ export async function savePersonalFishApiKey(
   }
   sessionOnlyFishApiKey = cleanKey;
   sessionUpdatedAt = now;
+  setLastFishSnapshot({
+    ...lastFishSnapshot,
+    status: 'unverified',
+    localKeySaved: true,
+    localStorageMode: 'session',
+    keySource: 'session',
+    authenticated: false,
+    message: 'API key kept for this session. Verifying with Fish Audio...',
+    checkedAt: null,
+  });
   return { rememberOnDevice: false, updatedAt: now };
 }
 
@@ -207,4 +280,14 @@ export async function deletePersonalFishApiKey(): Promise<void> {
   if (support.available) {
     await withCredentialStore('readwrite', (store) => store.delete(RECORD_ID));
   }
+  setLastFishSnapshot({
+    ...lastFishSnapshot,
+    status: 'not_configured',
+    localKeySaved: false,
+    localStorageMode: 'none',
+    keySource: 'none',
+    authenticated: false,
+    message: 'Personal Fish Audio API key removed from this device.',
+    checkedAt: null,
+  });
 }

@@ -390,9 +390,16 @@ app.get('/media/:bucket/:filename', (req, res) => {
 // System Diagnostics & Configuration Status
 app.get('/api/system/status', async (req, res) => {
   const caps = await checkFfmpegCapabilities();
+  const fishKeySource = extractBearerToken(req)
+    ? 'request_header'
+    : isFishAudioConfigured()
+    ? 'server_env'
+    : 'none';
   res.json({
     geminiConfigured: isGeminiConfigured(extractGeminiHeaderToken(req)),
-    fishConfigured: Boolean(extractBearerToken(req) || isFishAudioConfigured()),
+    fishConfigured: fishKeySource !== 'none',
+    fishKeySource,
+    functionsActive: true,
     ffmpegAvailable: caps.ffmpegAvailable,
     ffprobeAvailable: caps.ffprobeAvailable,
     ffmpegVersion: caps.ffmpegVersion,
@@ -490,8 +497,15 @@ app.get('/api/system/storage-usage', (_req, res) => {
 
 // Fish Audio Backend Status & Direct Proxy Endpoints
 app.get('/api/fish/status', (req, res) => {
+  const fishKeySource = extractBearerToken(req)
+    ? 'request_header'
+    : isFishAudioConfigured()
+    ? 'server_env'
+    : 'none';
   res.json({
-    configured: Boolean(extractBearerToken(req) || isFishAudioConfigured()),
+    configured: fishKeySource !== 'none',
+    keySource: fishKeySource,
+    functionsActive: true,
     ttsModel: 's2.1-pro-free',
     asrModel: 'transcribe-1-pro',
   });
@@ -502,10 +516,14 @@ app.post(['/api/fish-audio', '/api/fish/tts'], async (req, res) => {
     const apiKey = extractBearerToken(req);
 
     if (req.body?.action === 'test') {
-      if (!apiKey && !isFishAudioConfigured()) {
+      const keySource = apiKey ? 'personal' : isFishAudioConfigured() ? 'server_env' : 'none';
+      if (keySource === 'none') {
         res.status(401).json({
           ok: false,
           status: 'not_configured',
+          authenticated: false,
+          serviceReachable: true,
+          keySource: 'none',
           error:
             'Fish Audio API key is missing. Add your personal API key in Settings -> Fish Audio API Settings.',
         });
@@ -520,7 +538,7 @@ app.post(['/api/fish-audio', '/api/fish/tts'], async (req, res) => {
           : testRes.status === 'invalid_key'
           ? 401
           : 502);
-      res.status(status).json(payload);
+      res.status(status).json({ ...payload, keySource });
       return;
     }
 

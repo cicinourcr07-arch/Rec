@@ -34,6 +34,11 @@ import {
   VoiceConfig,
 } from '../types/studio';
 import { api, resolveApiUrl } from '../lib/api';
+import {
+  FishIntegrationSnapshot,
+  getLastFishSnapshot,
+  subscribeFishSnapshot,
+} from '../lib/fishKeyStore';
 import { formatBytes, formatTimecode } from '../lib/formatters';
 import { createWorkflowUpdate } from '../lib/workflowStages';
 import { normalizeSpeakerName } from '../lib/speakers';
@@ -91,6 +96,9 @@ export function VoiceStudioPage({
   const saveTimerRef = useRef<number | null>(null);
 
   const [fishConfigured, setFishConfigured] = useState<boolean | null>(null);
+  const [fishSnapshot, setFishSnapshot] = useState<FishIntegrationSnapshot>(() =>
+    getLastFishSnapshot()
+  );
   const [geminiConfigured, setGeminiConfigured] = useState<boolean | null>(null);
   const [sourceLanguage, setSourceLanguage] = useState<string>(
     project.translation.sourceLanguage || 'Auto'
@@ -138,11 +146,19 @@ export function VoiceStudioPage({
   const voice = project.voice;
 
   useEffect(() => {
+    const unsubscribe = subscribeFishSnapshot(setFishSnapshot);
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
     void api
       .getSystemStatus()
       .then((s) => {
         setFishConfigured(s.fishConfigured);
         setGeminiConfigured(s.geminiConfigured);
+        if (s.fishConfigured && getLastFishSnapshot().checkedAt === null) {
+          void api.testFishConnection(undefined, { allowServerFallback: true });
+        }
       })
       .catch(() => {
         setFishConfigured(null);
@@ -188,11 +204,11 @@ export function VoiceStudioPage({
   };
 
   useEffect(() => {
-    if (fishConfigured) {
+    if (fishConfigured && fishSnapshot.status !== 'invalid_key') {
       void loadFishVoices();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fishConfigured]);
+  }, [fishConfigured, fishSnapshot.status]);
 
   // Poll active Fish Audio dubbing job
   useEffect(() => {
@@ -657,23 +673,64 @@ export function VoiceStudioPage({
         </div>
       </div>
 
-      {fishConfigured === false && (
-        <div className="p-3.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
+      {(fishConfigured === false ||
+        fishSnapshot.status === 'not_configured' ||
+        fishSnapshot.status === 'invalid_key' ||
+        fishSnapshot.status === 'connection_error') && (
+        <div
+          className={`p-3.5 rounded-lg border text-xs flex flex-wrap items-center justify-between gap-3 ${
+            fishSnapshot.status === 'invalid_key'
+              ? 'bg-red-500/10 border-red-500/30 text-red-200'
+              : 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+          }`}
+        >
           <div className="flex items-start gap-2.5">
-            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <AlertCircle
+              className={`w-4 h-4 shrink-0 mt-0.5 ${
+                fishSnapshot.status === 'invalid_key' ? 'text-red-400' : 'text-amber-400'
+              }`}
+            />
             <div>
-              <span className="font-semibold">Fish Audio API key is not configured.</span> Add your
-              personal Fish Audio API key in{' '}
-              <strong className="text-amber-100">Settings &rarr; Fish Audio API Settings</strong> to
-              run Fish Audio ASR transcription and <code className="font-mono">s2.1-pro-free</code>{' '}
-              MP3 dubbing.
+              {fishSnapshot.status === 'invalid_key' ? (
+                <>
+                  <span className="font-semibold">
+                    Fish Audio API key was saved, but authentication failed.
+                  </span>{' '}
+                  {fishSnapshot.message} Update or re-test your key in{' '}
+                  <strong className="text-red-100">
+                    Settings &rarr; Fish Audio API Settings
+                  </strong>
+                  .
+                </>
+              ) : fishSnapshot.status === 'connection_error' ? (
+                <>
+                  <span className="font-semibold">Fish Audio connection check failed.</span>{' '}
+                  {fishSnapshot.message} Review your network or Cloudflare Pages Functions configuration in{' '}
+                  <strong className="text-amber-100">
+                    Settings &rarr; Fish Audio API Settings
+                  </strong>
+                  .
+                </>
+              ) : (
+                <>
+                  <span className="font-semibold">Fish Audio API key is not configured.</span> Add your
+                  personal Fish Audio API key in{' '}
+                  <strong className="text-amber-100">Settings &rarr; Fish Audio API Settings</strong>{' '}
+                  to run Fish Audio ASR transcription and{' '}
+                  <code className="font-mono">s2.1-pro-free</code> MP3 dubbing.
+                </>
+              )}
             </div>
           </div>
           {onNavigate && (
             <button
               type="button"
               onClick={() => onNavigate('settings')}
-              className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-xs font-semibold text-amber-100 shrink-0 cursor-pointer"
+              className={`px-3 py-1.5 rounded-lg border text-xs font-semibold shrink-0 cursor-pointer ${
+                fishSnapshot.status === 'invalid_key'
+                  ? 'bg-red-500/20 hover:bg-red-500/30 border-red-500/40 text-red-100'
+                  : 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/40 text-amber-100'
+              }`}
             >
               Open Settings
             </button>

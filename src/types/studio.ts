@@ -875,6 +875,8 @@ export interface RenderJob {
 export interface SystemStatus {
   geminiConfigured: boolean;
   fishConfigured: boolean;
+  fishKeySource?: 'request_header' | 'server_env' | 'none';
+  functionsActive?: boolean;
   ffmpegAvailable: boolean;
   ffprobeAvailable: boolean;
   ffmpegVersion: string;

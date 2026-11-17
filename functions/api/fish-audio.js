@@ -195,7 +195,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   }
 }
 
-async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
+async function handleConnectionTest(requestUrl, fishApiBase, apiKey, keySource) {
   let upstream;
   try {
     upstream = await fetchWithTimeout(
@@ -221,20 +221,60 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
       {
         ok: false,
         status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        keySource,
         error: isTimeout
           ? 'Connection to Fish Audio API timed out.'
-          : 'Unable to connect to Fish Audio API.',
+          : 'Unable to reach Fish Audio API.',
       },
       isTimeout ? 504 : 502
     );
   }
 
+  const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
+
+  // Check HTML proxy/WAF errors on ANY status (including 403/200) before attributing key errors
+  if (contentType.includes('text/html')) {
+    return jsonResponse(
+      requestUrl,
+      {
+        ok: false,
+        status: 'connection_error',
+        authenticated: false,
+        serviceReachable: false,
+        keySource,
+        error: `Unexpected HTML response (${upstream.status}) from Fish Audio upstream.`,
+      },
+      502
+    );
+  }
+
   if (upstream.status === 401 || upstream.status === 403) {
+    const errText = await upstream.text().catch(() => '');
+    const looksHtml = /^<!doctype/i.test(errText.trim()) || /^<html/i.test(errText.trim());
+    if (looksHtml) {
+      return jsonResponse(
+        requestUrl,
+        {
+          ok: false,
+          status: 'connection_error',
+          authenticated: false,
+          serviceReachable: false,
+          keySource,
+          error: `Fish Audio upstream proxy returned HTML (${upstream.status}) instead of API authentication JSON.`,
+        },
+        502
+      );
+    }
     return jsonResponse(
       requestUrl,
       {
         ok: false,
         status: 'invalid_key',
+        authenticated: false,
+        serviceReachable: true,
+        keySource,
         error: 'Invalid Fish Audio API key or unauthorized access.',
       },
       401
@@ -247,6 +287,9 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
       {
         ok: false,
         status: 'connection_error',
+        authenticated: true,
+        serviceReachable: true,
+        keySource,
         error: 'Fish Audio account balance or credits are insufficient.',
       },
       402
@@ -260,6 +303,9 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
       {
         ok: false,
         status: 'connection_error',
+        authenticated: true,
+        serviceReachable: true,
+        keySource,
         error: 'Fish Audio API rate limit exceeded. Please wait and try again.',
       },
       429,
@@ -274,33 +320,42 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
       {
         ok: false,
         status: 'connection_error',
+        authenticated: false,
+        serviceReachable: upstream.status < 500,
+        keySource,
         error: parseUpstreamError(errText, upstream.status, apiKey),
       },
       upstream.status >= 500 ? 502 : upstream.status
     );
   }
 
-  const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
-  if (contentType.includes('text/html')) {
+  if (contentType.includes('application/json')) {
+    const rawJson = await upstream.text().catch(() => '');
     return jsonResponse(
       requestUrl,
       {
         ok: false,
         status: 'connection_error',
-        error: 'Unexpected HTML response from Fish Audio API endpoint.',
+        authenticated: false,
+        serviceReachable: true,
+        keySource,
+        error: parseUpstreamError(rawJson, 502, apiKey),
       },
       502
     );
   }
 
   const responseBytes = await upstream.arrayBuffer().catch(() => new ArrayBuffer(0));
-  if (responseBytes.byteLength === 0) {
+  if (responseBytes.byteLength < 128) {
     return jsonResponse(
       requestUrl,
       {
         ok: false,
         status: 'connection_error',
-        error: 'Fish Audio API returned an empty response.',
+        authenticated: false,
+        serviceReachable: true,
+        keySource,
+        error: 'Fish Audio API returned an empty audio stream.',
       },
       502
     );
@@ -309,7 +364,10 @@ async function handleConnectionTest(requestUrl, fishApiBase, apiKey) {
   return jsonResponse(requestUrl, {
     ok: true,
     status: 'connected',
-    message: 'Connected to Fish Audio API.',
+    authenticated: true,
+    serviceReachable: true,
+    keySource,
+    message: 'Connected & authenticated with Fish Audio API.',
   });
 }
 
@@ -319,7 +377,18 @@ async function handlePostRequest(context) {
 
   const security = validateHttpsAndOrigin(request, requestUrl);
   if (!security.ok) {
-    return jsonResponse(requestUrl, { error: security.error }, security.status);
+    return jsonResponse(
+      requestUrl,
+      {
+        ok: false,
+        status: 'connection_error',
+        code: 'SECURITY_POLICY_BLOCKED',
+        authenticated: false,
+        serviceReachable: false,
+        error: security.error,
+      },
+      security.status
+    );
   }
 
   const personalKey = readPersonalKeyFromAuthorization(request);
@@ -329,6 +398,7 @@ async function handlePostRequest(context) {
       ? env.FISH_AUDIO_API_KEY.trim()
       : '';
   const apiKey = personalKey || fallbackEnvKey;
+  const keySource = personalKey ? 'personal' : fallbackEnvKey ? 'server_env' : 'none';
 
   if (!apiKey) {
     return jsonResponse(
@@ -336,6 +406,9 @@ async function handlePostRequest(context) {
       {
         ok: false,
         status: 'not_configured',
+        authenticated: false,
+        serviceReachable: true,
+        keySource: 'none',
         error:
           'Fish Audio API key is missing. Add your personal API key in Settings -> Fish Audio API Settings.',
       },
@@ -361,7 +434,7 @@ async function handlePostRequest(context) {
   ).replace(/\/+$/, '');
 
   if (body.action === 'test') {
-    return handleConnectionTest(requestUrl, fishApiBase, apiKey);
+    return handleConnectionTest(requestUrl, fishApiBase, apiKey, keySource);
   }
 
   const text = typeof body.text === 'string' ? body.text.trim() : '';

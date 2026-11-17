@@ -25,8 +25,12 @@ import { api } from '../lib/api';
 import {
   deletePersonalFishApiKey,
   FishConnectionStatus,
+  FishIntegrationSnapshot,
+  getLastFishSnapshot,
   loadPersonalFishKeyState,
   savePersonalFishApiKey,
+  setLastFishSnapshot,
+  subscribeFishSnapshot,
 } from '../lib/fishKeyStore';
 import {
   deletePersonalGeminiApiKey,
@@ -45,9 +49,14 @@ const CONNECTION_STATUS_UI: Record<
   { label: string; badgeClass: string; dotClass: string }
 > = {
   connected: {
-    label: 'Connected',
+    label: 'Connected · Authenticated',
     badgeClass: 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300',
     dotClass: 'bg-emerald-400',
+  },
+  unverified: {
+    label: 'Key Saved (Unverified)',
+    badgeClass: 'bg-sky-500/15 border-sky-500/35 text-sky-300',
+    dotClass: 'bg-sky-400',
   },
   invalid_key: {
     label: 'Invalid API Key',
@@ -74,14 +83,16 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
 
   // Personal Fish Audio API Key state (stored locally in IndexedDB only)
   const [fishKeyInput, setFishKeyInput] = useState('');
+  const [lastVerifiedFishKey, setLastVerifiedFishKey] = useState<string>('');
   const [showFishKey, setShowFishKey] = useState(false);
   const [rememberOnDevice, setRememberOnDevice] = useState(true);
   const [hasSavedFishKey, setHasSavedFishKey] = useState(false);
   const [fishKeyUpdatedAt, setFishKeyUpdatedAt] = useState<string | null>(null);
   const [indexedDbAvailable, setIndexedDbAvailable] = useState<boolean>(true);
   const [fishStorageError, setFishStorageError] = useState<string | null>(null);
-  const [fishConnectionStatus, setFishConnectionStatus] =
-    useState<FishConnectionStatus>('not_configured');
+  const [fishSnapshot, setFishSnapshot] = useState<FishIntegrationSnapshot>(() =>
+    getLastFishSnapshot()
+  );
   const [fishFeedback, setFishFeedback] = useState<{
     type: 'success' | 'error' | 'info';
     text: string;
@@ -112,8 +123,14 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
   };
 
   useEffect(() => {
+    const unsubscribe = subscribeFishSnapshot((snap) => {
+      setFishSnapshot(snap);
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
     let active = true;
-    refreshSystemStatus();
     if (typeof navigator !== 'undefined' && navigator.storage?.estimate) {
       void navigator.storage
         .estimate()
@@ -123,26 +140,53 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
         .catch(() => {});
     }
 
-    void loadPersonalFishKeyState().then(async (state) => {
+    void Promise.all([
+      api.getSystemStatus().catch(() => null),
+      loadPersonalFishKeyState(),
+    ]).then(async ([sysStatus, state]) => {
       if (!active) return;
+      if (sysStatus) {
+        setStatus(sysStatus);
+      }
       setIndexedDbAvailable(state.indexedDbAvailable);
       if (state.storageError) {
         setFishStorageError(state.storageError);
       }
+
       if (state.apiKey) {
         setFishKeyInput(state.apiKey);
+        setLastVerifiedFishKey(state.apiKey);
         setHasSavedFishKey(true);
         setRememberOnDevice(state.rememberOnDevice);
         setFishKeyUpdatedAt(state.updatedAt);
         setTestingFishKey(true);
-        const testRes = await api.testFishConnection(state.apiKey);
+        await api.testFishConnection(state.apiKey);
         if (!active) return;
-        setFishConnectionStatus(testRes.status);
+        setTestingFishKey(false);
+      } else if (sysStatus?.fishKeySource === 'server_env') {
+        setHasSavedFishKey(false);
+        setRememberOnDevice(state.indexedDbAvailable);
+        setTestingFishKey(true);
+        await api.testFishConnection(undefined, { allowServerFallback: true });
+        if (!active) return;
         setTestingFishKey(false);
       } else {
         setHasSavedFishKey(false);
         setRememberOnDevice(state.indexedDbAvailable);
-        setFishConnectionStatus('not_configured');
+        setLastFishSnapshot({
+          status: sysStatus?.functionsActive === false ? 'connection_error' : 'not_configured',
+          integrationConfigured: Boolean(sysStatus?.functionsActive),
+          localKeySaved: false,
+          localStorageMode: 'none',
+          keySource: 'none',
+          authenticated: false,
+          serviceReachable: false,
+          message:
+            sysStatus?.functionsActive === false
+              ? 'Backend /api/fish-audio endpoint is unreachable.'
+              : 'No Fish Audio API key configured.',
+          checkedAt: null,
+        });
       }
     });
 
@@ -189,14 +233,15 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
     setSavingFishKey(true);
     try {
       const saved = await savePersonalFishApiKey(fishKeyInput, rememberOnDevice);
+      const cleanSavedKey = fishKeyInput.trim();
       setHasSavedFishKey(true);
+      setLastVerifiedFishKey(cleanSavedKey);
       setRememberOnDevice(saved.rememberOnDevice);
       setFishKeyUpdatedAt(saved.updatedAt);
       refreshSystemStatus();
 
       setTestingFishKey(true);
-      const testRes = await api.testFishConnection();
-      setFishConnectionStatus(testRes.status);
+      const testRes = await api.testFishConnection(cleanSavedKey);
       setTestingFishKey(false);
 
       const storageLocation = saved.rememberOnDevice
@@ -231,8 +276,16 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
   const handleTestFishConnection = async () => {
     setFishFeedback(null);
     const keyToTest = fishKeyInput.trim();
-    if (!keyToTest) {
-      setFishConnectionStatus('not_configured');
+    const canTestServerFallback = !keyToTest && status?.fishKeySource === 'server_env';
+    if (!keyToTest && !canTestServerFallback) {
+      setLastFishSnapshot({
+        ...fishSnapshot,
+        status: 'not_configured',
+        authenticated: false,
+        keySource: 'none',
+        message: 'Enter your Fish Audio API key before testing the connection.',
+        checkedAt: new Date().toISOString(),
+      });
       setFishFeedback({
         type: 'error',
         text: 'Enter your Fish Audio API key before testing the connection.',
@@ -242,11 +295,10 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
 
     setTestingFishKey(true);
     try {
-      const stored = await loadPersonalFishKeyState();
-      const res = await api.testFishConnection(
-        stored.apiKey && stored.apiKey === keyToTest ? undefined : keyToTest
-      );
-      setFishConnectionStatus(res.status);
+      const res = await api.testFishConnection(keyToTest || undefined, {
+        allowServerFallback: canTestServerFallback,
+      });
+      setLastVerifiedFishKey(keyToTest);
       setFishFeedback({
         type: res.ok ? 'success' : 'error',
         text:
@@ -265,11 +317,19 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
     try {
       await deletePersonalFishApiKey();
       setFishKeyInput('');
+      setLastVerifiedFishKey('');
       setShowFishKey(false);
       setHasSavedFishKey(false);
       setFishKeyUpdatedAt(null);
-      setFishConnectionStatus('not_configured');
-      refreshSystemStatus();
+      const nextStatus = await api.getSystemStatus().catch(() => null);
+      if (nextStatus) {
+        setStatus(nextStatus);
+        if (nextStatus.fishKeySource === 'server_env') {
+          setTestingFishKey(true);
+          await api.testFishConnection(undefined, { allowServerFallback: true });
+          setTestingFishKey(false);
+        }
+      }
       setFishFeedback({
         type: 'info',
         text: 'Personal Fish Audio API key removed from this device.',
@@ -412,7 +472,13 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
     typeof MediaRecorder.isTypeSupported === 'function' &&
     MediaRecorder.isTypeSupported('video/webm');
   const hasWebCodecs = typeof (window as unknown as { VideoDecoder?: unknown }).VideoDecoder !== 'undefined';
-  const connUi = CONNECTION_STATUS_UI[fishConnectionStatus];
+  const inputEditedSinceTest =
+    fishKeyInput.trim().length > 0 && fishKeyInput.trim() !== lastVerifiedFishKey;
+  const effectiveFishStatus: FishConnectionStatus = inputEditedSinceTest
+    ? 'unverified'
+    : fishSnapshot.status;
+  const connUi = CONNECTION_STATUS_UI[effectiveFishStatus];
+  const providerConnUi = CONNECTION_STATUS_UI[fishSnapshot.status];
   const geminiConnUi = CONNECTION_STATUS_UI[geminiConnectionStatus];
 
   return (
@@ -853,27 +919,107 @@ export function SettingsPage({ onOpenBackupModal }: SettingsPageProps) {
               </div>
             </div>
 
-            <div className="py-3 flex items-center justify-between gap-4">
-              <div>
-                <div className="font-medium text-zinc-100">
-                  Fish Audio Dubbing API (Personal Device Key via Cloudflare Pages Function)
+            <div className="py-3 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <div className="font-medium text-zinc-100">
+                    Fish Audio Dubbing API (Personal Device Key via Cloudflare Pages Function)
+                  </div>
+                  <div className="text-zinc-500 mt-0.5">
+                    Uses your personal API key stored locally in IndexedDB (or server secret if configured) and forwards TTS checks cleanly through <code className="text-zinc-300">POST /api/fish-audio</code>.
+                  </div>
                 </div>
-                <div className="text-zinc-500 mt-0.5">
-                  Uses your personal API key stored locally in IndexedDB and forwards TTS requests securely through <code className="text-zinc-300">POST /api/fish-audio</code> with zero server-side key storage.
-                </div>
+                <span
+                  data-testid="fish-provider-status"
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-medium shrink-0 ${providerConnUi.badgeClass}`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${providerConnUi.dotClass}`} />
+                  {testingFishKey ? 'Verifying...' : providerConnUi.label}
+                </span>
               </div>
-              <div className="flex items-center gap-1.5 shrink-0 font-medium">
-                {status.fishConfigured ? (
-                  <>
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span className="text-emerald-300">Configured</span>
-                  </>
-                ) : (
-                  <>
-                    <AlertCircle className="w-4 h-4 text-amber-400" />
-                    <span className="text-amber-300">Not Configured</span>
-                  </>
-                )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px]">
+                <div className="p-2.5 rounded-lg bg-[#09090B] border border-white/[0.06]">
+                  <div className="text-zinc-500">Integration</div>
+                  <div
+                    className={`mt-0.5 font-medium ${
+                      fishSnapshot.integrationConfigured ? 'text-emerald-300' : 'text-amber-300'
+                    }`}
+                  >
+                    {fishSnapshot.integrationConfigured
+                      ? 'Functions Active (/api/fish-audio)'
+                      : 'Routing Unavailable'}
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-[#09090B] border border-white/[0.06]">
+                  <div className="text-zinc-500">Local Key Storage</div>
+                  <div
+                    className={`mt-0.5 font-medium ${
+                      fishSnapshot.localKeySaved
+                        ? 'text-zinc-100'
+                        : fishSnapshot.keySource === 'server_env'
+                        ? 'text-sky-300'
+                        : 'text-zinc-400'
+                    }`}
+                  >
+                    {fishSnapshot.localStorageMode === 'indexeddb'
+                      ? 'Saved in IndexedDB'
+                      : fishSnapshot.localStorageMode === 'session'
+                      ? 'Session Memory Only'
+                      : fishSnapshot.keySource === 'server_env'
+                      ? 'Server Env Secret'
+                      : 'Not Saved'}
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-[#09090B] border border-white/[0.06]">
+                  <div className="text-zinc-500">Authentication</div>
+                  <div
+                    className={`mt-0.5 font-medium ${
+                      fishSnapshot.authenticated
+                        ? 'text-emerald-300'
+                        : fishSnapshot.status === 'invalid_key'
+                        ? 'text-red-300'
+                        : fishSnapshot.status === 'not_configured'
+                        ? 'text-zinc-400'
+                        : 'text-amber-300'
+                    }`}
+                  >
+                    {testingFishKey
+                      ? 'Checking API...'
+                      : fishSnapshot.authenticated
+                      ? 'Authenticated (200)'
+                      : fishSnapshot.status === 'invalid_key'
+                      ? 'Rejected (Invalid Key)'
+                      : fishSnapshot.status === 'not_configured'
+                      ? 'Not Configured'
+                      : fishSnapshot.checkedAt
+                      ? 'Unauthenticated'
+                      : 'Unverified'}
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-[#09090B] border border-white/[0.06]">
+                  <div className="text-zinc-500">Fish Audio Service</div>
+                  <div
+                    className={`mt-0.5 font-medium ${
+                      fishSnapshot.serviceReachable
+                        ? 'text-emerald-300'
+                        : fishSnapshot.checkedAt
+                        ? 'text-amber-300'
+                        : 'text-zinc-400'
+                    }`}
+                  >
+                    {testingFishKey
+                      ? 'Connecting...'
+                      : fishSnapshot.serviceReachable
+                      ? 'Reachable'
+                      : fishSnapshot.checkedAt
+                      ? 'Unreachable / Proxy Error'
+                      : 'Not Tested Yet'}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
