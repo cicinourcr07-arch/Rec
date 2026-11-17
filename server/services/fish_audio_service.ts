@@ -78,16 +78,95 @@ export function isFishAudioConfigured(): boolean {
   return readFishAudioEnvKey().length > 0;
 }
 
-function getFishApiKey(): string {
-  const key = readFishAudioEnvKey();
+function getFishApiKey(overrideKey?: string): string {
+  const cleanOverride = typeof overrideKey === 'string' ? overrideKey.trim() : '';
+  const key =
+    cleanOverride && !PLACEHOLDER_KEYS.has(cleanOverride.toLowerCase())
+      ? cleanOverride
+      : readFishAudioEnvKey();
   if (!key) {
     const err = new Error(
-      'FISH_AUDIO_API_KEY is not configured on the backend. Add FISH_AUDIO_API_KEY=your_key_here to your local .env file or hosting environment variables.'
+      'Fish Audio API key is missing. Add your personal API key in Settings -> Fish Audio API Settings.'
     );
-    (err as Error & { statusCode?: number }).statusCode = 503;
+    (err as Error & { statusCode?: number }).statusCode = 401;
     throw err;
   }
   return key;
+}
+
+export async function testFishAudioConnection(overrideKey?: string): Promise<{
+  ok: boolean;
+  status: 'connected' | 'invalid_key' | 'connection_error';
+  message?: string;
+  error?: string;
+  credit?: string;
+}> {
+  const apiKey = getFishApiKey(overrideKey);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    let res = await fetch(`${FISH_API_BASE}/wallet/self/api-credit`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+    });
+    if (res.status === 404) {
+      res = await fetch(`${FISH_API_BASE}/model?self=true&page_size=1`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, status: 'invalid_key', error: 'Invalid Fish Audio API key.' };
+    }
+    if (res.status === 429) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        error: 'Fish Audio API rate limit exceeded. Please try again shortly.',
+      };
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: 'connection_error',
+        error: `Fish Audio API returned HTTP ${res.status}.`,
+      };
+    }
+    let credit: string | undefined;
+    try {
+      const json = (await res.json()) as { credit?: unknown };
+      if (json && json.credit !== undefined) {
+        credit = String(json.credit);
+      }
+    } catch {
+      // ignore non-critical body parse issues
+    }
+    return {
+      ok: true,
+      status: 'connected',
+      message: 'Connected to Fish Audio API.',
+      ...(credit !== undefined ? { credit } : {}),
+    };
+  } catch (err) {
+    const isTimeout = err instanceof Error && err.name === 'AbortError';
+    return {
+      ok: false,
+      status: 'connection_error',
+      error: isTimeout
+        ? 'Connection to Fish Audio API timed out.'
+        : 'Unable to reach Fish Audio API.',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchFishWithTimeout(
@@ -184,8 +263,9 @@ export async function listFishVoices(params: {
   selfOnly?: boolean;
   language?: string;
   pageSize?: number;
+  apiKey?: string;
 }): Promise<{ voices: FishVoiceModel[]; total: number }> {
-  const apiKey = getFishApiKey();
+  const apiKey = getFishApiKey(params.apiKey);
   const qs = new URLSearchParams();
   qs.set('page_size', String(params.pageSize || 24));
   qs.set('sort_by', 'task_count');
@@ -253,12 +333,13 @@ export async function transcribeVideoWithFishAudio(params: {
   duration: number;
   hasAudio: boolean;
   sourceLanguage?: string;
+  apiKey?: string;
 }): Promise<{ segments: CaptionSegment[]; detectedLanguage: string }> {
   if (!params.hasAudio) {
     throw new Error('The uploaded video does not contain an audio track to transcribe.');
   }
 
-  const apiKey = getFishApiKey();
+  const apiKey = getFishApiKey(params.apiKey);
   const tempInput = params.audioBuffer
     ? path.join(TEMP_DIR, `fish_asr_in_${params.projectId}_${Date.now()}_${path.basename(params.audioFilename || 'audio.wav')}`)
     : null;
@@ -436,17 +517,22 @@ export async function synthesizeFishMp3Buffer(params: {
   text: string;
   referenceId?: string;
   format?: 'mp3' | 'wav' | 'pcm' | 'opus';
+  model?: string;
+  speakingSpeed?: number;
+  latency?: 'normal' | 'balanced';
+  normalize?: boolean;
   maxAttempts?: number;
+  apiKey?: string;
 }): Promise<Buffer> {
-  const apiKey = getFishApiKey();
+  const apiKey = getFishApiKey(params.apiKey);
   const body: Record<string, unknown> = {
     text: params.text,
     format: params.format || 'mp3',
-    normalize: true,
-    latency: 'balanced',
+    normalize: params.normalize !== undefined ? params.normalize : true,
+    latency: params.latency || 'balanced',
     chunk_length: 250,
     prosody: {
-      speed: 1.0,
+      speed: typeof params.speakingSpeed === 'number' ? params.speakingSpeed : 1.0,
       volume: 0.0,
     },
   };
@@ -454,6 +540,7 @@ export async function synthesizeFishMp3Buffer(params: {
     body.reference_id = params.referenceId.trim();
   }
   const payloadStr = JSON.stringify(body);
+  const modelHeader = params.model?.trim() || 's2.1-pro-free';
 
   const res = await fetchFishWithRetry(
     '/v1/tts',
@@ -462,7 +549,7 @@ export async function synthesizeFishMp3Buffer(params: {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
-        model: 's2.1-pro-free',
+        model: modelHeader,
       },
       body: payloadStr,
     }),
@@ -487,6 +574,7 @@ export async function generateFishVoicePreview(params: {
   text: string;
   referenceId?: string;
   speakingSpeed?: number;
+  apiKey?: string;
 }): Promise<{ audioUrl: string; filePath: string }> {
   const finalName = `fish_preview_${params.projectId.slice(0, 8)}_${Date.now()}.mp3`;
   const finalMp3 = path.join(AUDIO_DIR, finalName);
@@ -495,6 +583,7 @@ export async function generateFishVoicePreview(params: {
   const mp3Buffer = await synthesizeFishMp3Buffer({
     text: params.text,
     referenceId: params.referenceId,
+    apiKey: params.apiKey,
   });
 
   fs.writeFileSync(finalMp3, mp3Buffer);
@@ -546,8 +635,9 @@ async function synthesizeOneSegment(params: {
   spokenText: string;
   referenceId?: string;
   maxAttempts: number;
+  apiKey?: string;
 }): Promise<SynthesizedSegmentOutput> {
-  const { projectId, seg, index, spokenText, referenceId, maxAttempts } = params;
+  const { projectId, seg, index, spokenText, referenceId, maxAttempts, apiKey } = params;
   const uid = `${index}_${uuidv4().slice(0, 6)}`;
   const rawMp3 = path.join(TEMP_DIR, `fish_seg_raw_${uid}.mp3`);
   const clipFilename = `fish_dub_seg_${projectId.slice(0, 8)}_${uid}.mp3`;
@@ -557,6 +647,7 @@ async function synthesizeOneSegment(params: {
     text: spokenText,
     referenceId,
     maxAttempts,
+    apiKey,
   });
 
   fs.writeFileSync(rawMp3, mp3Buffer);
@@ -772,6 +863,7 @@ export async function generateFishSynchronizedDub(params: {
   voiceConfig: VoiceConfig;
   useTranslated: boolean;
   totalDuration: number;
+  apiKey?: string;
   onProgress?: (progress: number, stage: string, etaSeconds: number | null) => void;
 }): Promise<{
   clips: GeneratedVoiceClip[];
@@ -783,7 +875,7 @@ export async function generateFishSynchronizedDub(params: {
     throw new Error('No transcript segments found. Transcribe or add segments first.');
   }
 
-  getFishApiKey();
+  getFishApiKey(params.apiKey);
 
   const workItems = params.captions
     .map((seg, idx) => {
@@ -854,6 +946,7 @@ export async function generateFishSynchronizedDub(params: {
           spokenText: item.spokenText,
           referenceId: lockedReferenceId,
           maxAttempts: 3,
+          apiKey: params.apiKey,
         });
         results[myIdx] = out;
         completedCount += 1;
@@ -883,6 +976,7 @@ export async function generateFishSynchronizedDub(params: {
           spokenText: failed.item.spokenText,
           referenceId: lockedReferenceId,
           maxAttempts: 2,
+          apiKey: params.apiKey,
         });
         results[failed.workIdx] = out;
         completedCount += 1;
@@ -1133,6 +1227,7 @@ const dubQueue: Array<{
   captions: CaptionSegment[];
   useTranslated: boolean;
   totalDuration: number;
+  apiKey?: string;
 }> = [];
 let dubWorkerRunning = false;
 
@@ -1142,8 +1237,9 @@ export function enqueueFishDubJob(params: {
   captions: CaptionSegment[];
   useTranslated: boolean;
   totalDuration?: number;
+  apiKey?: string;
 }): RenderJob {
-  getFishApiKey();
+  getFishApiKey(params.apiKey);
   const project = getProject(params.projectId);
   const maxSegEnd = params.captions.reduce((m, s) => Math.max(m, s.end || 0), 10);
   const totalDuration = Math.max(
@@ -1179,6 +1275,7 @@ export function enqueueFishDubJob(params: {
     captions: params.captions,
     useTranslated: params.useTranslated,
     totalDuration,
+    apiKey: params.apiKey,
   });
   void processDubQueue();
   return job;
@@ -1210,6 +1307,7 @@ async function processDubQueue() {
           voiceConfig: task.voiceConfig,
           useTranslated: task.useTranslated,
           totalDuration,
+          apiKey: task.apiKey,
           onProgress: (progress, stage, etaSeconds) => {
             updateJob(task.jobId, { progress, stage, etaSeconds });
           },
@@ -1397,6 +1495,7 @@ export async function regenerateFishSegments(params: {
   voiceConfig?: Partial<VoiceConfig>;
   useTranslated?: boolean;
   totalDuration?: number;
+  apiKey?: string;
 }): Promise<{
   project: Project;
   regeneratedIds: string[];
@@ -1405,7 +1504,7 @@ export async function regenerateFishSegments(params: {
   syncPlan: TimelineSyncPlan;
   report: ReturnType<typeof generateDubDiagnosticReport>;
 }> {
-  getFishApiKey();
+  getFishApiKey(params.apiKey);
 
   const existingProject = getProject(params.projectId);
   const captions =
@@ -1473,6 +1572,7 @@ export async function regenerateFishSegments(params: {
         spokenText,
         referenceId: lockedReferenceId,
         maxAttempts: 3,
+        apiKey: params.apiKey,
       });
       outputs.push(synthesized);
       if (targetIds.has(seg.id)) {

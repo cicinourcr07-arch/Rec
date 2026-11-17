@@ -62,6 +62,11 @@ import {
   renderMergedDubWavFromClips,
 } from './browserAudioDubbing';
 import {
+  FishConnectionStatus,
+  getPersonalFishApiKey,
+  hasPersonalFishApiKey,
+} from './fishKeyStore';
+import {
   applySyncPlanToClips,
   buildTimelineSyncPlan,
   clampContinuousPauseMs,
@@ -142,13 +147,38 @@ export function resolveApiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${cleanPath}` : cleanPath;
 }
 
+function isFishEndpointPath(url: string): boolean {
+  return (
+    url.startsWith('/api/fish') ||
+    url.includes('/dubbing/') ||
+    url.startsWith('/api/system/status')
+  );
+}
+
+function scrubSecretFromText(text: string, secret?: string | null): string {
+  let clean = text;
+  if (secret && secret.length >= 4) {
+    clean = clean.split(secret).join('[redacted]');
+  }
+  return clean.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
+}
+
 async function aiBackendRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const fullUrl = resolveApiUrl(url);
+  const headers = new Headers(init?.headers || {});
+  let usedPersonalKey: string | null = null;
+  if (isFishEndpointPath(url) && !headers.has('Authorization')) {
+    usedPersonalKey = await getPersonalFishApiKey();
+    if (usedPersonalKey) {
+      headers.set('Authorization', `Bearer ${usedPersonalKey}`);
+    }
+  }
+
   let res: Response;
   try {
-    res = await fetch(fullUrl, init);
+    res = await fetch(fullUrl, { ...init, headers });
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = scrubSecretFromText(err instanceof Error ? err.message : String(err), usedPersonalKey);
     throw new Error(
       `Automated AI service is unreachable (${detail}). Video handling, preview, export, SRT/VTT import, and External Gemini (No Key) work 100% locally in your browser.`
     );
@@ -168,8 +198,9 @@ async function aiBackendRequest<T>(url: string, init?: RequestInit): Promise<T> 
         `Automated server-side AI endpoint is unavailable on static hosting (HTTP ${res.status}). API keys are never exposed in frontend code — use External Gemini (No Key) mode or run with an AI backend configured.`
       );
     }
-    const errMsg = typeof data?.error === 'string' ? data.error : `AI request failed (${res.status})`;
-    throw new Error(errMsg);
+    const errMsg =
+      typeof data?.error === 'string' ? data.error : `AI request failed (${res.status})`;
+    throw new Error(scrubSecretFromText(errMsg, usedPersonalKey));
   }
   if (!data) {
     throw new Error('Unexpected non-JSON response from AI endpoint.');
@@ -246,13 +277,17 @@ export const uploadVideoChunked = processLocalVideoUpload;
 export const api = {
   // Diagnostics: returns real browser status + optional AI server status without failing static sites
   getSystemStatus: async (): Promise<SystemStatus> => {
+    const localFishConfigured = await hasPersonalFishApiKey();
     try {
       const serverStatus = await aiBackendRequest<SystemStatus>('/api/system/status');
-      return serverStatus;
+      return {
+        ...serverStatus,
+        fishConfigured: Boolean(serverStatus.fishConfigured || localFishConfigured),
+      };
     } catch {
       return {
         geminiConfigured: false,
-        fishConfigured: false,
+        fishConfigured: localFishConfigured,
         ffmpegAvailable: typeof MediaRecorder !== 'undefined',
         ffprobeAvailable: typeof HTMLVideoElement !== 'undefined',
         ffmpegVersion: 'Browser Canvas + MediaRecorder',
@@ -263,6 +298,85 @@ export const api = {
         supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
       };
     }
+  },
+
+  testFishConnection: async (overrideKey?: string): Promise<{
+    ok: boolean;
+    status: FishConnectionStatus;
+    message: string;
+    credit?: string;
+  }> => {
+    const rawKey = overrideKey !== undefined ? overrideKey : await getPersonalFishApiKey();
+    const keyToTest = (rawKey || '').trim();
+    if (!keyToTest) {
+      return {
+        ok: false,
+        status: 'not_configured',
+        message: 'No Fish Audio API key configured. Enter and save your personal API key.',
+      };
+    }
+
+    const endpointUrl = resolveApiUrl('/api/fish-audio');
+    let res: Response;
+    try {
+      res = await fetch(endpointUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${keyToTest}`,
+        },
+        body: JSON.stringify({ action: 'test' }),
+      });
+    } catch (err) {
+      const detail = scrubSecretFromText(err instanceof Error ? err.message : String(err), keyToTest);
+      return {
+        ok: false,
+        status: 'connection_error',
+        message: `Unable to reach /api/fish-audio (${detail}).`,
+      };
+    }
+
+    const raw = await res.text().catch(() => '');
+    let parsed: Record<string, unknown> | null = null;
+    if (raw) {
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+    }
+
+    if (res.ok && parsed?.ok) {
+      return {
+        ok: true,
+        status: 'connected',
+        message:
+          typeof parsed.message === 'string'
+            ? parsed.message
+            : 'Connected to Fish Audio API.',
+        credit: typeof parsed.credit === 'string' ? parsed.credit : undefined,
+      };
+    }
+
+    const rawErr =
+      (typeof parsed?.error === 'string' && parsed.error) ||
+      (typeof parsed?.message === 'string' && parsed.message) ||
+      `Connection check failed (${res.status}).`;
+    const cleanErr = scrubSecretFromText(rawErr, keyToTest);
+
+    if (res.status === 401 || res.status === 403 || parsed?.status === 'invalid_key') {
+      return {
+        ok: false,
+        status: 'invalid_key',
+        message: cleanErr || 'Invalid Fish Audio API key.',
+      };
+    }
+
+    return {
+      ok: false,
+      status: 'connection_error',
+      message: cleanErr,
+    };
   },
 
   getLocalStorageUsage: () => getBrowserMediaUsage(),
@@ -1071,11 +1185,13 @@ export const api = {
     referenceId?: string;
     format?: 'mp3' | 'wav' | 'pcm' | 'opus';
   }) => {
+    const personalKey = await getPersonalFishApiKey();
     const audioBlob = await fetchFishAudioFromEndpoint({
       endpointUrl: resolveApiUrl('/api/fish-audio'),
       text: params.text,
       referenceId: params.referenceId,
       format: params.format || 'mp3',
+      apiKey: personalKey,
     });
     const saved = await saveMediaBlob({
       bucket: 'audio',
@@ -1090,11 +1206,13 @@ export const api = {
     projectId: string,
     params: { text: string; referenceId?: string; speakingSpeed: number }
   ) => {
+    const personalKey = await getPersonalFishApiKey();
     const audioBlob = await fetchFishAudioFromEndpoint({
       endpointUrl: resolveApiUrl('/api/fish-audio'),
       text: params.text,
       referenceId: params.referenceId,
       format: 'mp3',
+      apiKey: personalKey,
     });
     const saved = await saveMediaBlob({
       bucket: 'audio',
@@ -1110,6 +1228,7 @@ export const api = {
     params: { voice: Project['voice']; captions?: Project['captions']; useTranslated?: boolean }
   ) => {
     const localProject = await getProjectLocal(projectId);
+    const personalKey = await getPersonalFishApiKey();
     const res = await aiBackendRequest<{ job?: RenderJob; workerEdgeMode?: boolean }>(
       `/api/projects/${projectId}/dubbing/generate`,
       {
@@ -1140,7 +1259,7 @@ export const api = {
       type: 'voice',
       status: 'processing',
       progress: 2,
-      stage: 'Synthesizing Fish Audio segments via Worker (/api/fish-audio)...',
+      stage: 'Synthesizing Fish Audio segments via Pages Function (/api/fish-audio)...',
       etaSeconds: null,
       outputUrl: null,
       outputSize: null,
@@ -1158,6 +1277,7 @@ export const api = {
           voiceConfig: params.voice,
           useTranslated: params.useTranslated ?? true,
           fishEndpointUrl: resolveApiUrl('/api/fish-audio'),
+          apiKey: personalKey,
           onProgress: (progress, stage, etaSeconds) => {
             void upsertJobLocal({
               ...initialJob,
@@ -1313,12 +1433,14 @@ export const api = {
         speakingSpeed: 1.0,
         enabled: true,
       };
+      const personalKey = await getPersonalFishApiKey();
       const result = await generateEdgeFishDubbing({
         project: localProject,
         captions,
         voiceConfig: mergedVoice,
         useTranslated: params.useTranslated ?? true,
         fishEndpointUrl: resolveApiUrl('/api/fish-audio'),
+        apiKey: personalKey,
         targetSegmentIds: new Set(params.segmentIds),
       });
       const targetSet = new Set(params.segmentIds);

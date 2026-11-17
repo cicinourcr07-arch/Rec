@@ -35,47 +35,36 @@
 ## Architecture
 
 - **Frontend**: `src/` (React 19, TypeScript, Tailwind CSS v4, Lucide Icons) — handles all video selection, preview, frame extraction, audio extraction, subtitles, and rendering locally in the browser via File API, Canvas, Web Audio, MediaRecorder, and IndexedDB.
-- **Cloudflare Worker Backend + Static Assets**: `wrangler.jsonc` + `worker/index.ts` (plus `functions/api/[[catchall]].ts` fallback for Pages) — serves `./dist` static assets via `env.ASSETS` and executes `/api/fish-audio` and `/api/fish/*` using `env.FISH_AUDIO_API_KEY`.
+- **Personal Fish Audio API Key Storage**: `src/lib/fishKeyStore.ts` stores the user's personal Fish Audio API key locally inside browser IndexedDB (`recap_studio_personal_keys_v1`) when **Remember API Key on this device** is enabled, or in memory for the current session only. It is never uploaded to any database, exported in project backups, logged, or committed to GitHub.
+- **Cloudflare Pages Functions**:
+  - `functions/api/fish-audio.js`: Accepts `POST /api/fish-audio` requests only over HTTPS from the same origin, reads the user's personal key from the `Authorization: Bearer <token>` header, supports real connection verification (`{ action: "test" }`), and forwards TTS requests to `https://api.fish.audio/v1/tts` without logging or persisting the key.
+  - `functions/api/[[catchall]].ts`: Handles `/api/system/status`, `/api/fish/status`, `/api/fish/voices`, `/api/fish/asr`, `/api/projects/:id/dubbing/*`, and `/api/projects/:id/translate` directly on Cloudflare Pages Functions.
 - **Local Express Dev Server**: `server.ts` + `server/services/` (port `3000`)
 
-## Environment Variables
+## Configuration & Personal API Keys
 
-Configure via a local `.env` file (ignored by Git via `.gitignore`) for local development, or in Cloudflare Worker **Variables and Secrets** for production (never expose secret keys in `VITE_*` variables):
+- **Fish Audio (No Central Server Secret Required)**:
+  1. Open **Settings → Fish Audio API Settings** inside the app.
+  2. Paste your personal Fish Audio API key, choose **Remember API Key on this device** (IndexedDB), click **Save API Key**, and verify with **Test Connection**.
+  3. Never use `VITE_FISH_AUDIO_API_KEY` or commit keys to source control.
+- **Optional Server Environment Variables**:
+  - `FISH_API_BASE_URL`: Optional Fish Audio API base URL (default `https://api.fish.audio`).
+  - `GEMINI_API_KEY`: Optional key for server-side automated AI translation.
 
-- `FISH_AUDIO_API_KEY`: Required on the Worker/backend for Fish Audio TTS (`/api/fish-audio`), ASR transcription (`/api/fish/asr`), and voice library browsing (`/api/fish/voices`).
-- `FISH_API_BASE_URL`: Optional Fish Audio API base URL (default `https://api.fish.audio`).
-- `GEMINI_API_KEY`: Optional key for server-side automated AI translation.
-
-### Deploying to Cloudflare Workers + Static Assets (Recommended via GitHub)
-
-This repository includes `wrangler.jsonc` configured with `"main": "worker/index.ts"` and `"assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/health"] }`, allowing you to deploy both the Vite SPA and `/api/fish-audio` Worker backend together—and add environment secrets cleanly in Cloudflare.
+### Deploying to Cloudflare Pages (GitHub Integration)
 
 1. Push this repository to GitHub (`.env` is excluded by `.gitignore`).
-2. In the **Cloudflare Dashboard** → **Compute (Workers)** → **Workers & Pages** → **Create** → **Import a repository** (connect your GitHub repo).
-3. Configure the build settings:
+2. In your **Cloudflare Pages** project, verify **Build & deployments**:
    - **Build command**: `npm run build`
-   - **Deploy command**: `npx wrangler deploy`
-   - **Root directory**: `/` (leave default)
-4. Click **Deploy** once to create the Worker.
-5. Open your Worker → **Settings** → **Variables and Secrets** → **+ Add**:
-   - Type: **Secret**
-   - Variable name: `FISH_AUDIO_API_KEY`
-   - Value: your actual Fish Audio API key
-   - Click **Deploy / Save** (Cloudflare will redeploy with `env.FISH_AUDIO_API_KEY` active).
-   - *(CLI alternative)*: run `npm run build && npx wrangler secret put FISH_AUDIO_API_KEY && npx wrangler deploy`.
+   - **Build output directory**: `dist`
+3. Cloudflare Pages automatically deploys `functions/api/fish-audio.js` as `/api/fish-audio` and serves `dist/` for the frontend. No `FISH_AUDIO_API_KEY` environment variable needs to be configured in Cloudflare for users to enter and use their own personal keys.
 
 ## Running Locally
 
-1. Add your key in `.env`:
-   ```env
-   FISH_AUDIO_API_KEY=your_key_here
-   ```
-2. Install dependencies and start the server:
+1. Install dependencies and start the server:
    ```bash
    npm install
    npm run dev
    ```
-
-The server listens on `http://localhost:3000`.
-
+2. Open `http://localhost:3000`, go to **Settings → Fish Audio API Settings**, and add your personal Fish Audio API key.
 

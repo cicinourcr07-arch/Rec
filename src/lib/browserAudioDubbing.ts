@@ -18,6 +18,7 @@ import {
   clampContinuousPauseMs,
   normalizeSyncMode,
 } from '../../server/services/timeline_sync_service';
+import { getPersonalFishApiKey } from './fishKeyStore';
 
 function getAudioContextCtor(): typeof AudioContext | null {
   if (typeof window === 'undefined') return null;
@@ -138,15 +139,46 @@ export async function fetchFishAudioFromEndpoint(params: {
   text: string;
   referenceId?: string;
   format?: 'mp3' | 'wav' | 'pcm' | 'opus';
+  model?: string;
+  speakingSpeed?: number;
+  latency?: 'normal' | 'balanced';
+  normalize?: boolean;
+  apiKey?: string | null;
 }): Promise<Blob> {
+  const payload: Record<string, unknown> = {
+    text: params.text,
+    format: params.format || 'mp3',
+  };
+  if (params.referenceId?.trim()) {
+    payload.referenceId = params.referenceId.trim();
+    payload.reference_id = params.referenceId.trim();
+  }
+  if (params.model?.trim()) {
+    payload.model = params.model.trim();
+  }
+  if (params.speakingSpeed !== undefined) {
+    payload.speakingSpeed = params.speakingSpeed;
+  }
+  if (params.latency) {
+    payload.latency = params.latency;
+  }
+  if (params.normalize !== undefined) {
+    payload.normalize = params.normalize;
+  }
+
+  const resolvedKey =
+    (params.apiKey !== undefined ? params.apiKey : await getPersonalFishApiKey())?.trim() || '';
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (resolvedKey) {
+    headers.Authorization = `Bearer ${resolvedKey}`;
+  }
+
   const res = await fetch(params.endpointUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      text: params.text,
-      referenceId: params.referenceId?.trim() || undefined,
-      format: params.format || 'mp3',
-    }),
+    headers,
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
@@ -157,6 +189,9 @@ export async function fetchFishAudioFromEndpoint(params: {
       if (parsed?.error) msg = parsed.error;
     } catch {
       if (textBody.trim()) msg = textBody.trim();
+    }
+    if (resolvedKey && resolvedKey.length >= 4) {
+      msg = msg.split(resolvedKey).join('[redacted]');
     }
     throw new Error(msg);
   }
@@ -217,6 +252,7 @@ export async function generateEdgeFishDubbing(params: {
   voiceConfig: VoiceConfig;
   useTranslated: boolean;
   fishEndpointUrl: string;
+  apiKey?: string | null;
   targetSegmentIds?: Set<string>;
   onProgress?: (progress: number, stage: string, etaSeconds: number | null) => void;
 }): Promise<{
@@ -225,8 +261,19 @@ export async function generateEdgeFishDubbing(params: {
   syncPlan: TimelineSyncPlan;
   regeneratedIds: string[];
 }> {
-  const { project, captions, voiceConfig, useTranslated, fishEndpointUrl, targetSegmentIds, onProgress } =
-    params;
+  const {
+    project,
+    captions,
+    voiceConfig,
+    useTranslated,
+    fishEndpointUrl,
+    apiKey,
+    targetSegmentIds,
+    onProgress,
+  } = params;
+
+  const resolvedKey =
+    (apiKey !== undefined ? apiKey : await getPersonalFishApiKey())?.trim() || '';
 
   const existingClipsById = new Map(
     (voiceConfig.generatedClips || []).map((c) => [c.segmentId, c])
@@ -278,7 +325,7 @@ export async function generateEdgeFishDubbing(params: {
     const eta = i >= 2 && ratio > 0 ? Math.max(1, Math.round((elapsedSec / ratio) * (1 - ratio) + 2)) : null;
     onProgress?.(
       Math.min(86, Math.round(6 + ratio * 80)),
-      `Synthesizing segment ${i + 1}/${workItems.length} via Cloudflare Worker (/api/fish-audio)...`,
+      `Synthesizing segment ${i + 1}/${workItems.length} via /api/fish-audio...`,
       eta
     );
 
@@ -287,6 +334,7 @@ export async function generateEdgeFishDubbing(params: {
       text: spokenText,
       referenceId: lockedRef,
       format: 'mp3',
+      apiKey: resolvedKey,
     });
 
     const analyzed = await analyzeClipAudioBlob(mp3Blob);

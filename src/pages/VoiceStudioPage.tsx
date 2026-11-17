@@ -562,15 +562,26 @@ export function VoiceStudioPage({
       </div>
 
       {fishConfigured === false && (
-        <div className="p-3.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 flex items-start gap-2.5">
-          <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-          <div>
-            <span className="font-semibold">FISH_AUDIO_API_KEY is not configured on the server.</span> Add{' '}
-            <code className="font-mono text-amber-100">FISH_AUDIO_API_KEY</code> to your local{' '}
-            <code className="font-mono text-amber-100">.env</code> file or hosting environment
-            variables to run Fish Audio ASR transcription and{' '}
-            <code className="font-mono">s2.1-pro-free</code> MP3 dubbing.
+        <div className="p-3.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">Fish Audio API key is not configured.</span> Add your
+              personal Fish Audio API key in{' '}
+              <strong className="text-amber-100">Settings &rarr; Fish Audio API Settings</strong> to
+              run Fish Audio ASR transcription and <code className="font-mono">s2.1-pro-free</code>{' '}
+              MP3 dubbing.
+            </div>
           </div>
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => onNavigate('settings')}
+              className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-xs font-semibold text-amber-100 shrink-0 cursor-pointer"
+            >
+              Open Settings
+            </button>
+          )}
         </div>
       )}
 

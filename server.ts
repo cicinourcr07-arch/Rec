@@ -98,6 +98,7 @@ import {
   regenerateFishSegments,
   resyncExistingFishClips,
   synthesizeFishMp3Buffer,
+  testFishAudioConnection,
   transcribeVideoWithFishAudio,
 } from './server/services/fish_audio_service.ts';
 import {
@@ -122,6 +123,15 @@ import {
 const PORT = Number(process.env.PORT) || 3000;
 const app = express();
 app.set('trust proxy', 1);
+
+function extractBearerToken(req: express.Request): string | undefined {
+  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+  const m = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!m) return undefined;
+  const token = m[1].trim();
+  if (!token || /[\r\n\s]/.test(token)) return undefined;
+  return token;
+}
 
 function parseAllowedOrigins(): string[] {
   const raw = [
@@ -395,10 +405,10 @@ app.get('/api/system/storage-usage', (_req, res) => {
   }
 });
 
-// Fish Audio Backend Status & Direct Proxy Endpoints (reads process.env.FISH_AUDIO_API_KEY exclusively on backend)
-app.get('/api/fish/status', (_req, res) => {
+// Fish Audio Backend Status & Direct Proxy Endpoints
+app.get('/api/fish/status', (req, res) => {
   res.json({
-    configured: isFishAudioConfigured(),
+    configured: Boolean(extractBearerToken(req) || isFishAudioConfigured()),
     ttsModel: 's2.1-pro-free',
     asrModel: 'transcribe-1-pro',
   });
@@ -406,28 +416,56 @@ app.get('/api/fish/status', (_req, res) => {
 
 app.post(['/api/fish-audio', '/api/fish/tts'], async (req, res) => {
   try {
+    const apiKey = extractBearerToken(req);
+
+    if (req.body?.action === 'test') {
+      if (!apiKey && !isFishAudioConfigured()) {
+        res.status(401).json({
+          ok: false,
+          status: 'not_configured',
+          error:
+            'Fish Audio API key is missing. Add your personal API key in Settings -> Fish Audio API Settings.',
+        });
+        return;
+      }
+      const testRes = await testFishAudioConnection(apiKey);
+      const httpStatus =
+        testRes.status === 'connected'
+          ? 200
+          : testRes.status === 'invalid_key'
+          ? 401
+          : 502;
+      res.status(httpStatus).json(testRes);
+      return;
+    }
+
     const text = String(req.body?.text || '').trim();
     if (!text) {
       res.status(400).json({ error: 'text is required for Fish Audio TTS.' });
       return;
     }
-    const referenceId =
-      typeof req.body?.referenceId === 'string'
-        ? req.body.referenceId
-        : typeof req.body?.reference_id === 'string'
-        ? req.body.reference_id
-        : undefined;
+    const referenceIdRaw =
+      req.body?.reference_id ?? req.body?.referenceId ?? req.body?.voiceId ?? req.body?.voice_id;
+    const referenceId = typeof referenceIdRaw === 'string' ? referenceIdRaw.trim() : undefined;
     const rawFormat = String(req.body?.format || 'mp3').toLowerCase();
     const format = (['mp3', 'wav', 'pcm', 'opus'].includes(rawFormat) ? rawFormat : 'mp3') as
       | 'mp3'
       | 'wav'
       | 'pcm'
       | 'opus';
+    const model = typeof req.body?.model === 'string' ? req.body.model.trim() : undefined;
+    const speedRaw = Number(req.body?.prosody?.speed ?? req.body?.speakingSpeed ?? req.body?.speed);
+    const speakingSpeed = Number.isFinite(speedRaw)
+      ? Math.min(2.0, Math.max(0.5, speedRaw))
+      : undefined;
 
     const audioBuffer = await synthesizeFishMp3Buffer({
       text,
       referenceId,
       format,
+      model,
+      speakingSpeed,
+      apiKey,
     });
 
     const contentTypeMap = {
@@ -446,6 +484,13 @@ app.post(['/api/fish-audio', '/api/fish/tts'], async (req, res) => {
   }
 });
 
+app.all(['/api/fish-audio', '/api/fish/tts'], (_req, res) => {
+  res
+    .setHeader('Allow', 'POST')
+    .status(405)
+    .json({ error: 'Method Not Allowed. Only POST requests are accepted at /api/fish-audio.' });
+});
+
 app.post('/api/fish/asr', uploadMem.single('audio'), async (req, res) => {
   try {
     if (!req.file || !req.file.buffer || req.file.buffer.length === 0) {
@@ -462,6 +507,7 @@ app.post('/api/fish/asr', uploadMem.single('audio'), async (req, res) => {
       duration,
       hasAudio: true,
       sourceLanguage,
+      apiKey: extractBearerToken(req),
     });
     res.json(result);
   } catch (err) {
@@ -476,7 +522,12 @@ app.get('/api/fish/voices', async (req, res) => {
     const query = typeof req.query.q === 'string' ? req.query.q : undefined;
     const selfOnly = req.query.self === 'true';
     const language = typeof req.query.language === 'string' ? req.query.language : undefined;
-    const result = await listFishVoices({ query, selfOnly, language });
+    const result = await listFishVoices({
+      query,
+      selfOnly,
+      language,
+      apiKey: extractBearerToken(req),
+    });
     res.json(result);
   } catch (err) {
     const status = (err as { statusCode?: number }).statusCode || 500;
@@ -1463,6 +1514,7 @@ app.post('/api/projects/:id/dubbing/transcribe', uploadMem.single('audio'), asyn
         duration,
         hasAudio: true,
         sourceLanguage,
+        apiKey: extractBearerToken(req),
       });
     } else {
       if (!project || !project.sourceVideoUrl || !project.metadata) {
@@ -1482,6 +1534,7 @@ app.post('/api/projects/:id/dubbing/transcribe', uploadMem.single('audio'), asyn
         duration: project.metadata.duration,
         hasAudio: project.metadata.hasAudio,
         sourceLanguage,
+        apiKey: extractBearerToken(req),
       });
     }
 
@@ -1533,6 +1586,7 @@ app.post('/api/projects/:id/dubbing/preview', async (req, res) => {
       text,
       referenceId,
       speakingSpeed: 1.0,
+      apiKey: extractBearerToken(req),
     });
 
     res.json({ audioUrl: preview.audioUrl });
@@ -1582,6 +1636,7 @@ app.post('/api/projects/:id/dubbing/generate', (req, res) => {
       captions,
       useTranslated,
       totalDuration,
+      apiKey: extractBearerToken(req),
     });
 
     res.status(202).json({ job });
@@ -1680,6 +1735,7 @@ app.post('/api/projects/:id/dubbing/regenerate-segments', async (req, res) => {
         req.body?.useTranslated !== undefined ? Boolean(req.body.useTranslated) : undefined,
       totalDuration:
         typeof req.body?.totalDuration === 'number' ? req.body.totalDuration : undefined,
+      apiKey: extractBearerToken(req),
     });
     res.json(result);
   } catch (err) {
